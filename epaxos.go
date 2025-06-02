@@ -227,6 +227,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	// Fast path: all replies agree
+	//TODO The acceptance rate should be dynamically obtained from the CLI or config file
 	if same && okCount > len(r.Peers)/2 {
 
 		LogFastPath()
