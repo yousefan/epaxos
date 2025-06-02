@@ -1,7 +1,7 @@
+// Updated replica.go
 package main
 
 import (
-	"log"
 	"sync"
 )
 
@@ -42,23 +42,31 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 		return false
 	}
 
+	LogExecutionAttempt(r.ID, instanceID, inst)
+
 	// Check all dependencies are executed
 	for _, depID := range inst.Deps {
 		depInst, ok := r.Instances[replicaID][depID]
 		if !ok || !depInst.Executed {
+			GetLogger().Debug(EXECUTION, "Replica %d: Cannot execute instance %d, dependency %d not executed",
+				r.ID, instanceID, depID)
 			return false // cannot execute yet
 		}
 	}
 
 	// Apply the command to the local KV store
-	_, err := r.KVStore.ApplyCommand(inst.Command)
+	oldStatus := inst.Status
+	result, err := r.KVStore.ApplyCommand(inst.Command)
 	if err != nil {
-		log.Printf("Failed to execute instance %d: %v", instanceID, err)
+		LogExecutionFailure(r.ID, instanceID, inst.Command, err)
 		return false
 	}
 
 	inst.Executed = true
 	inst.Status = StatusExecuted
-	log.Printf("Replica %d: Executed instance %d (%s)", r.ID, instanceID, inst.Command.Key)
+
+	LogExecutionSuccess(r.ID, instanceID, inst.Command, result)
+	LogInstanceStateChange(r.ID, instanceID, oldStatus, inst.Status, inst)
+
 	return true
 }
