@@ -1,3 +1,4 @@
+// Updated kvstore.go
 package main
 
 import (
@@ -23,6 +24,10 @@ func (k *KVStore) Put(key, value string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.store[key] = value
+
+	if GetLogger() != nil {
+		LogKVStoreOperation(0, "PUT", key, value, true, nil)
+	}
 }
 
 // Get retrieves a value for a given key
@@ -30,6 +35,17 @@ func (k *KVStore) Get(key string) (string, bool) {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
 	val, ok := k.store[key]
+
+	if GetLogger() != nil {
+		var err error
+		if !ok {
+			err = fmt.Errorf("key not found")
+			LogKVStoreOperation(0, "GET", key, "", false, err)
+		} else {
+			LogKVStoreOperation(0, "GET", key, val, true, nil)
+		}
+	}
+
 	return val, ok
 }
 
@@ -38,7 +54,7 @@ func (k *KVStore) ApplyCommand(cmd Command) (string, error) {
 	switch cmd.Type {
 	case CmdPut:
 		k.Put(cmd.Key, cmd.Value)
-		return "", nil
+		return cmd.Value, nil
 	case CmdGet:
 		val, ok := k.Get(cmd.Key)
 		if !ok {

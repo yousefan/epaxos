@@ -1,7 +1,6 @@
 package main
 
 import (
-	"log"
 	"net/rpc"
 )
 
@@ -57,6 +56,8 @@ type AcceptReply struct {
 // === ReplicaRPC Additions ===
 
 func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error {
+	LogPreAcceptPhase(args.ReplicaID, args.InstanceID, args.Command, args.CommandID)
+
 	r.Replica.InstanceLock.Lock()
 	defer r.Replica.InstanceLock.Unlock()
 
@@ -75,12 +76,14 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 				continue
 			}
 			if commandsConflict(inst.Command, args.Command) {
+				LogConflictDetection(args.ReplicaID, args.InstanceID, rid, iid, args.Command, inst.Command)
 				// Adjust sequence number
 				if inst.Seq >= maxSeq {
 					maxSeq = inst.Seq + 1
 				}
 				// Add dependency on conflicting instance
 				if rid == int(r.Replica.ID) {
+					LogDependencyAdded(args.ReplicaID, args.InstanceID, iid)
 					newDeps = appendIfMissing(newDeps, iid)
 				}
 			}
@@ -102,13 +105,14 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 	reply.Seq = maxSeq
 	reply.Deps = newDeps
 
-	log.Printf("Replica %d: PreAccepted instance %d from %d with Seq=%d, Deps=%v\n",
-		r.Replica.ID, args.InstanceID, args.ReplicaID, maxSeq, newDeps)
+	LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Seq, maxSeq, args.Deps, newDeps, reply.OK)
 
 	return nil
 }
 
 func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
+	LogCommitPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps)
+
 	r.Replica.InstanceLock.Lock()
 	if _, ok := r.Replica.Instances[int(args.ReplicaID)]; !ok {
 		r.Replica.Instances[int(args.ReplicaID)] = make(map[int]*EPaxosInstance)
@@ -124,7 +128,7 @@ func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 	r.Replica.InstanceLock.Unlock()
 
-	log.Printf("Replica %d: Committed instance %d from %d\n", r.Replica.ID, args.InstanceID, args.ReplicaID)
+	LogCommitResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, true)
 
 	// Try to execute right after committing
 	go r.Replica.TryExecute(int(args.ReplicaID), args.InstanceID)
@@ -136,6 +140,7 @@ func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
 // === Send PreAccept to Peers ===
 
 func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, error) {
+	LogRPCCall(args.ReplicaID, address, "ReplicaRPC.PreAccept", args)
 	client, err := rpc.Dial("tcp", address)
 	if err != nil {
 		return nil, err
@@ -144,6 +149,7 @@ func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, e
 
 	var reply PreAcceptReply
 	err = client.Call("ReplicaRPC.PreAccept", args, &reply)
+	LogRPCReceive(args.ReplicaID, "ReplicaRPC.PreAccept", args)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +159,7 @@ func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, e
 // === Send Commit to Peers ===
 
 func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
+	LogRPCCall(args.ReplicaID, address, "ReplicaRPC.Commit", args)
 	client, err := rpc.Dial("tcp", address)
 	if err != nil {
 		return nil, err
@@ -161,6 +168,7 @@ func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
 
 	var reply CommitReply
 	err = client.Call("ReplicaRPC.Commit", args, &reply)
+	LogRPCReceive(args.ReplicaID, "ReplicaRPC.Commit", args)
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +207,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	for _, peer := range r.Peers {
 		reply, err := SendPreAcceptToPeer(peer, args)
 		if err != nil {
-			log.Printf("PreAccept to %s failed: %v", peer, err)
+			GetLogger().Error(PREACCEPT, "PreAccept to %s failed: %v", peer, err)
 			continue
 		}
 		if reply.OK {
@@ -219,9 +227,10 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	// Fast path: all replies agree
+	//TODO The acceptance rate should be dynamically obtained from the CLI or config file
 	if same && okCount > len(r.Peers)/2 {
-		log.Println("Fast path: committing directly")
 
+		LogFastPath()
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
 			InstanceID: instanceID,
@@ -252,8 +261,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	// Slow path: send Accept
-	log.Println("Slow path: sending Accept")
-
+	LogSlowPath()
 	maxSeq := base.Seq
 	for _, r := range replies {
 		if r.Seq > maxSeq {
@@ -293,7 +301,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	for _, peer := range r.Peers {
 		reply, err := SendAcceptToPeer(peer, acceptArgs)
 		if err != nil {
-			log.Printf("Accept to %s failed: %v", peer, err)
+			GetLogger().Error(ACCEPT, "Accept to %s failed: %v", peer, err)
 			continue
 		}
 		if reply.OK {
@@ -302,8 +310,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	if ackCount > len(r.Peers)/2 {
-		log.Println("Accept quorum achieved: committing")
-
+		LogAcceptQuorum()
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
 			InstanceID: instanceID,
@@ -330,13 +337,15 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 		r.InstanceLock.Unlock()
 	} else {
-		log.Println("Accept quorum not achieved. Will retry or abort.")
+		LogAcceptQuorumFailure()
 	}
 
 	return nil
 }
 
 func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
+	LogAcceptPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps, args.Ballot)
+
 	r.Replica.InstanceLock.Lock()
 	defer r.Replica.InstanceLock.Unlock()
 
@@ -358,7 +367,8 @@ func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
 	reply.OK = true
 	reply.Ballot = args.Ballot
 
-	log.Printf("Replica %d: Accepted instance %d from %d (Ballot %d)", r.Replica.ID, args.InstanceID, args.ReplicaID, args.Ballot)
+	LogAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Ballot, reply.OK)
+
 	return nil
 }
 
