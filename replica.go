@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Replica represents a single EPaxos node in the cluster
@@ -154,6 +155,7 @@ func (r *Replica) BuildDependencyGraph(replicaID, instanceID int) *DependencyGra
 
 	graph := NewDependencyGraph()
 	visited := make(map[string]bool)
+	missingDependencies := make(map[string]bool)
 
 	var buildRecursive func(int, int)
 	buildRecursive = func(rid, iid int) {
@@ -166,10 +168,18 @@ func (r *Replica) BuildDependencyGraph(replicaID, instanceID int) *DependencyGra
 		// Get the instance
 		instanceMap, exists := r.Instances[rid]
 		if !exists {
+			missingDependencies[key] = true
+			GetLogger().Warn(EXECUTION, "Missing instance map for replica %d when building dependency graph", rid)
 			return
 		}
 		instance, exists := instanceMap[iid]
-		if !exists || !instance.Committed {
+		if !exists {
+			missingDependencies[key] = true
+			GetLogger().Warn(EXECUTION, "Missing instance R%d.%d when building dependency graph", rid, iid)
+			return
+		}
+		if !instance.Committed {
+			GetLogger().Debug(EXECUTION, "Instance R%d.%d not yet committed, skipping from dependency graph", rid, iid)
 			return
 		}
 
@@ -184,6 +194,18 @@ func (r *Replica) BuildDependencyGraph(replicaID, instanceID int) *DependencyGra
 	}
 
 	buildRecursive(replicaID, instanceID)
+
+	// If we found missing dependencies, trigger recovery for them
+	if len(missingDependencies) > 0 {
+		GetLogger().Info(EXECUTION, "Found %d missing dependencies, triggering recovery", len(missingDependencies))
+		for depKey := range missingDependencies {
+			// Parse the key back to replicaID and instanceID
+			var depRid, depIid int
+			fmt.Sscanf(depKey, "%d-%d", &depRid, &depIid)
+			go r.RecoverInstance(depRid, depIid)
+		}
+	}
+
 	return graph
 }
 
@@ -192,19 +214,50 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 	r.InstanceLock.Lock()
 	defer r.InstanceLock.Unlock()
 
+	// Check if instance exists and is in the right state
 	instanceMap, ok := r.Instances[replicaID]
 	if !ok {
+		// Instance map doesn't exist - try to recover
+		GetLogger().Warn(EXECUTION, "Instance map for replica %d not found, attempting recovery", replicaID)
+		go r.RecoverInstance(replicaID, instanceID)
 		return false
 	}
+
 	inst, ok := instanceMap[instanceID]
-	if !ok || !inst.Committed || inst.Executed {
+	if !ok {
+		// Instance doesn't exist - try to recover
+		GetLogger().Warn(EXECUTION, "Instance R%d.%d not found, attempting recovery", replicaID, instanceID)
+		go r.RecoverInstance(replicaID, instanceID)
 		return false
+	}
+
+	if !inst.Committed {
+		GetLogger().Debug(EXECUTION, "Instance R%d.%d not yet committed, cannot execute", replicaID, instanceID)
+		return false
+	}
+
+	if inst.Executed {
+		GetLogger().Debug(EXECUTION, "Instance R%d.%d already executed", replicaID, instanceID)
+		return true
 	}
 
 	LogExecutionAttempt(ReplicaID(replicaID), instanceID, inst)
 
+	// Check if all dependencies are available and executed
+	if !r.CheckAllDependenciesExecuted(inst) {
+		GetLogger().Debug(EXECUTION, "Instance R%d.%d dependencies not all executed yet", replicaID, instanceID)
+		return false
+	}
+
 	// Step 1: Build dependency graph
 	graph := r.BuildDependencyGraph(replicaID, instanceID)
+
+	// Check if the target instance is in the graph
+	targetKey := makeKey(replicaID, instanceID)
+	if _, exists := graph.Nodes[targetKey]; !exists {
+		GetLogger().Warn(EXECUTION, "Target instance R%d.%d not found in dependency graph", replicaID, instanceID)
+		return false
+	}
 
 	// Step 2: Find strongly connected components
 	sccs := graph.StronglyConnectedComponents()
@@ -213,6 +266,7 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 	// In this simplified version, we'll execute in the order we found them
 
 	// Step 4: Execute commands in each SCC
+	executed := false
 	for _, scc := range sccs {
 		// Sort commands in this SCC by sequence number
 		var sccInstances []*GraphNode
@@ -232,17 +286,24 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 
 		// Execute all commands in this SCC
 		for _, node := range sccInstances {
-			r.executeCommand(node.ReplicaID, node.InstanceID, node.Instance)
+			wasExecuted := r.executeCommand(node.ReplicaID, node.InstanceID, node.Instance)
+			if node.ReplicaID == replicaID && node.InstanceID == instanceID {
+				executed = wasExecuted
+			}
 		}
 	}
 
-	return true
+	if !executed {
+		GetLogger().Warn(EXECUTION, "Target instance R%d.%d was not executed in any SCC", replicaID, instanceID)
+	}
+
+	return executed
 }
 
 // executeCommand executes a single command and marks it as executed
-func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance) {
+func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance) bool {
 	if inst.Executed {
-		return
+		return true
 	}
 
 	// Check if this is a no-op command
@@ -250,7 +311,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 		inst.Executed = true
 		inst.Status = StatusExecuted
 		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, "noop")
-		return
+		return true
 	}
 
 	// Apply the command to the local KV store
@@ -258,7 +319,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	result, err := r.KVStore.ApplyCommand(inst.Command)
 	if err != nil {
 		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, err)
-		return
+		return false
 	}
 
 	inst.Executed = true
@@ -266,6 +327,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 
 	LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, result)
 	LogInstanceStateChange(ReplicaID(replicaID), instanceID, oldStatus, inst.Status, inst)
+	return true
 }
 
 // CheckAllDependenciesExecuted verifies that all dependencies of an instance have been executed
@@ -273,10 +335,20 @@ func (r *Replica) CheckAllDependenciesExecuted(inst *EPaxosInstance) bool {
 	for _, dep := range inst.Deps {
 		depInstanceMap, exists := r.Instances[dep.ReplicaID]
 		if !exists {
+			GetLogger().Debug(EXECUTION, "Dependency R%d.%d: replica map not found", dep.ReplicaID, dep.InstanceID)
+			// Try to recover the missing dependency
+			go r.RecoverInstance(dep.ReplicaID, dep.InstanceID)
 			return false
 		}
 		depInst, exists := depInstanceMap[dep.InstanceID]
-		if !exists || !depInst.Executed {
+		if !exists {
+			GetLogger().Debug(EXECUTION, "Dependency R%d.%d: instance not found", dep.ReplicaID, dep.InstanceID)
+			// Try to recover the missing dependency
+			go r.RecoverInstance(dep.ReplicaID, dep.InstanceID)
+			return false
+		}
+		if !depInst.Executed {
+			GetLogger().Debug(EXECUTION, "Dependency R%d.%d: not yet executed", dep.ReplicaID, dep.InstanceID)
 			return false
 		}
 	}
@@ -285,9 +357,56 @@ func (r *Replica) CheckAllDependenciesExecuted(inst *EPaxosInstance) bool {
 
 // RecoverInstance attempts to recover a potentially failed instance
 func (r *Replica) RecoverInstance(replicaID, instanceID int) {
-	GetLogger().Info(CONSENSUS, "Attempting to recover instance %d.%d", replicaID, instanceID)
+	GetLogger().Info(CONSENSUS, "Attempting to recover instance R%d.%d", replicaID, instanceID)
+
+	// Add a small delay to avoid thundering herd
+	time.Sleep(time.Duration(r.ID) * 100 * time.Millisecond)
+
+	// Check if the instance already exists after the delay
+	r.InstanceLock.RLock()
+	if instanceMap, exists := r.Instances[replicaID]; exists {
+		if inst, exists := instanceMap[instanceID]; exists && inst.Committed {
+			r.InstanceLock.RUnlock()
+			GetLogger().Debug(CONSENSUS, "Instance R%d.%d already recovered", replicaID, instanceID)
+			return
+		}
+	}
+	r.InstanceLock.RUnlock()
+
 	err := r.ExplicitPrepare(replicaID, instanceID)
 	if err != nil {
-		GetLogger().Error(CONSENSUS, "Failed to recover instance %d.%d: %v", replicaID, instanceID, err)
+		GetLogger().Error(CONSENSUS, "Failed to recover instance R%d.%d: %v", replicaID, instanceID, err)
+	} else {
+		GetLogger().Info(CONSENSUS, "Successfully initiated recovery for instance R%d.%d", replicaID, instanceID)
 	}
+}
+
+// GetInstance safely retrieves an instance with proper error handling
+func (r *Replica) GetInstance(replicaID, instanceID int) (*EPaxosInstance, bool) {
+	r.InstanceLock.RLock()
+	defer r.InstanceLock.RUnlock()
+
+	instanceMap, exists := r.Instances[replicaID]
+	if !exists {
+		return nil, false
+	}
+
+	inst, exists := instanceMap[instanceID]
+	if !exists {
+		return nil, false
+	}
+
+	return inst, true
+}
+
+// SetInstance safely sets an instance with proper error handling
+func (r *Replica) SetInstance(replicaID, instanceID int, inst *EPaxosInstance) {
+	r.InstanceLock.Lock()
+	defer r.InstanceLock.Unlock()
+
+	if _, exists := r.Instances[replicaID]; !exists {
+		r.Instances[replicaID] = make(map[int]*EPaxosInstance)
+	}
+
+	r.Instances[replicaID][instanceID] = inst
 }

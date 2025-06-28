@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/rpc"
 )
 
@@ -308,6 +309,35 @@ func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) 
 	return &reply, nil
 }
 
+// runLocalPreAccept runs PreAccept logic locally and returns the result
+func (r *Replica) runLocalPreAccept(command Command, cmdID CommandID, seq int, deps []Dependency, ballot Ballot) (int, []Dependency) {
+	r.InstanceLock.RLock()
+	defer r.InstanceLock.RUnlock()
+
+	// === Local Conflict Detection ===
+	maxSeq := seq
+	newDeps := make([]Dependency, len(deps))
+	copy(newDeps, deps)
+
+	for rid, instanceMap := range r.Instances {
+		for iid, inst := range instanceMap {
+			if inst == nil || inst.CommandID == cmdID {
+				continue
+			}
+			if commandsConflict(inst.Command, command) {
+				// Adjust sequence number
+				if inst.Seq >= maxSeq {
+					maxSeq = inst.Seq + 1
+				}
+				// Add dependency on conflicting instance
+				newDeps = appendDependencyIfMissing(newDeps, rid, iid)
+			}
+		}
+	}
+
+	return maxSeq, newDeps
+}
+
 func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	r.InstanceLock.Lock()
 	instanceID := r.NextInstance
@@ -328,19 +358,43 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		ReplicaID: int(r.ID),
 	}
 
+	// Run PreAccept logic locally first
+	localSeq, localDeps := r.runLocalPreAccept(command, cmdID, initialSeq, initialDeps, ballot)
+
 	args := PreAcceptArgs{
 		ReplicaID:  r.ID,
 		InstanceID: instanceID,
 		Command:    command,
 		CommandID:  cmdID,
-		Seq:        initialSeq,
-		Deps:       initialDeps,
+		Seq:        localSeq,
+		Deps:       localDeps,
 		Ballot:     ballot,
 	}
 
 	replies := []PreAcceptReply{}
 	okCount := 1 // Include self
-	replies = append(replies, PreAcceptReply{Seq: initialSeq, Deps: initialDeps})
+	// Add self reply with local conflict detection results
+	replies = append(replies, PreAcceptReply{
+		OK:     true,
+		Seq:    localSeq,
+		Deps:   localDeps,
+		Ballot: ballot,
+	})
+
+	// Save the instance locally
+	r.InstanceLock.Lock()
+	if _, ok := r.Instances[int(r.ID)]; !ok {
+		r.Instances[int(r.ID)] = make(map[int]*EPaxosInstance)
+	}
+	r.Instances[int(r.ID)][instanceID] = &EPaxosInstance{
+		Command:   command,
+		CommandID: cmdID,
+		Seq:       localSeq,
+		Deps:      localDeps,
+		Status:    StatusPreAccepted,
+		Ballot:    ballot,
+	}
+	r.InstanceLock.Unlock()
 
 	// Send PreAccept to peers
 	for _, peer := range r.Peers {
@@ -382,19 +436,13 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			go SendCommitToPeer(peer, commitArgs)
 		}
 
-		// Save locally
+		// Update local instance to committed
 		r.InstanceLock.Lock()
-		if _, ok := r.Instances[int(r.ID)]; !ok {
-			r.Instances[int(r.ID)] = make(map[int]*EPaxosInstance)
-		}
-		r.Instances[int(r.ID)][instanceID] = &EPaxosInstance{
-			Command:   command,
-			CommandID: cmdID,
-			Seq:       base.Seq,
-			Deps:      base.Deps,
-			Status:    StatusCommitted,
-			Committed: true,
-			Ballot:    ballot,
+		if inst, exists := r.Instances[int(r.ID)][instanceID]; exists {
+			inst.Seq = base.Seq
+			inst.Deps = base.Deps
+			inst.Status = StatusCommitted
+			inst.Committed = true
 		}
 		r.InstanceLock.Unlock()
 		return nil
@@ -447,18 +495,14 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			go SendCommitToPeer(peer, commitArgs)
 		}
 
+		// Update local instance to committed
 		r.InstanceLock.Lock()
-		if _, ok := r.Instances[int(r.ID)]; !ok {
-			r.Instances[int(r.ID)] = make(map[int]*EPaxosInstance)
-		}
-		r.Instances[int(r.ID)][instanceID] = &EPaxosInstance{
-			Command:   command,
-			CommandID: cmdID,
-			Seq:       maxSeq,
-			Deps:      allDeps,
-			Status:    StatusCommitted,
-			Committed: true,
-			Ballot:    ballot,
+		if inst, exists := r.Instances[int(r.ID)][instanceID]; exists {
+			inst.Seq = maxSeq
+			inst.Deps = allDeps
+			inst.Status = StatusCommitted
+			inst.Committed = true
+			inst.Ballot = ballot
 		}
 		r.InstanceLock.Unlock()
 	} else {
@@ -487,8 +531,9 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 	replies := []*PrepareReply{}
 	okCount := 0
 
-	// Send Prepare to all replicas
-	for _, peer := range r.Peers {
+	// Send Prepare to all replicas (including self through RPC for consistency)
+	allPeers := append(r.Peers, fmt.Sprintf("localhost:%d", 8000+int(r.ID)))
+	for _, peer := range allPeers {
 		reply, err := SendPrepareToPeer(peer, args)
 		if err != nil {
 			GetLogger().Error(CONSENSUS, "Prepare to %s failed: %v", peer, err)

@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"time"
@@ -12,15 +11,51 @@ import (
 
 func main() {
 	// Parse startup flags
-	// Replace flag parsing with this:
 	id := flag.Int("id", 0, "Replica ID (must match line in peers.txt)")
 	peersFile := flag.String("peersFile", "peers.txt", "Path to peers.txt file")
+	logLevel := flag.String("log-level", "INFO", "Log level (DEBUG, INFO, WARN, ERROR, FATAL)")
+	logDir := flag.String("log-dir", "logs", "Directory for log files")
 	flag.Parse()
+
+	// Initialize logger
+	var level LogLevel
+	switch strings.ToUpper(*logLevel) {
+	case "DEBUG":
+		level = DEBUG
+	case "INFO":
+		level = INFO
+	case "WARN":
+		level = WARN
+	case "ERROR":
+		level = ERROR
+	case "FATAL":
+		level = FATAL
+	default:
+		level = INFO
+	}
+
+	logConfig := LoggerConfig{
+		Level:         level,
+		ReplicaID:     ReplicaID(*id),
+		LogDir:        *logDir,
+		LogFileName:   fmt.Sprintf("epaxos_replica_%d.log", *id),
+		ConsoleOutput: false, // Disable console output to avoid interference with REPL
+		FileOutput:    true,
+	}
+
+	if err := InitLogger(logConfig); err != nil {
+		fmt.Printf("Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer GetLogger().Close()
+
+	// Log startup
+	GetLogger().Info(GENERAL, "EPaxos replica %d starting...", *id)
 
 	// Open and parse peers.txt
 	file, err := os.Open(*peersFile)
 	if err != nil {
-		log.Fatalf("Failed to open peers file: %v", err)
+		GetLogger().Fatal(GENERAL, "Failed to open peers file: %v", err)
 	}
 	defer file.Close()
 
@@ -37,7 +72,7 @@ func main() {
 		}
 		parts := strings.Fields(line)
 		if len(parts) != 3 {
-			log.Fatalf("Invalid line in peers.txt: %s", line)
+			GetLogger().Fatal(GENERAL, "Invalid line in peers.txt: %s", line)
 		}
 
 		lineID := parts[0]
@@ -52,33 +87,47 @@ func main() {
 	}
 
 	if thisAddr == "" {
-		log.Fatalf("Could not find self ID (%d) in peers.txt", *id)
+		GetLogger().Fatal(GENERAL, "Could not find self ID (%d) in peers.txt", *id)
 	}
 
 	// Initialize the replica
 	replica := NewReplica(ReplicaID(*id), peers)
+	LogReplicaStart(replica.ID, thisAddr, peers)
 
 	// Start RPC server
 	if err := StartRPCServer(replica, thisAddr); err != nil {
-		log.Fatalf("Failed to start RPC server: %v", err)
+		GetLogger().Fatal(NETWORK, "Failed to start RPC server: %v", err)
 	}
 
+	// Background execution loop with worker pool to prevent goroutine explosion
 	go func() {
 		for {
 			replica.InstanceLock.RLock()
+			var instancesToExecute []struct{ rid, iid int }
+
 			for rid, instMap := range replica.Instances {
-				for iid := range instMap {
-					go replica.TryExecute(rid, iid)
+				for iid, inst := range instMap {
+					if inst != nil && inst.Committed && !inst.Executed {
+						instancesToExecute = append(instancesToExecute, struct{ rid, iid int }{rid, iid})
+					}
 				}
 			}
 			replica.InstanceLock.RUnlock()
+
+			// Execute instances (limit concurrent executions)
+			for _, inst := range instancesToExecute {
+				go replica.TryExecute(inst.rid, inst.iid)
+			}
+
 			time.Sleep(1 * time.Second)
 		}
 	}()
 
 	// REPL to simulate client commands
 	reader := bufio.NewReader(os.Stdin)
+	GetLogger().Info(CLIENT, "Replica is running. Type 'put key value' or 'get key':")
 	fmt.Println("Replica is running. Type 'put key value' or 'get key':")
+
 	for {
 		fmt.Print(">> ")
 		input, _ := reader.ReadString('\n')
@@ -106,8 +155,10 @@ func main() {
 				Value: args[2],
 			}
 			cmdID := CommandID{ClientID: "cli", SeqNum: time.Now().Nanosecond()}
+			LogClientRequest(replica.ID, cmd, cmdID)
 			err := replica.Propose(cmd, cmdID)
 			if err != nil {
+				GetLogger().Error(CLIENT, "Error executing PUT: %v", err)
 				fmt.Println("Error:", err)
 			} else {
 				fmt.Println("OK")
@@ -119,16 +170,29 @@ func main() {
 				Key:  args[1],
 			}
 			cmdID := CommandID{ClientID: "cli", SeqNum: time.Now().Nanosecond()}
+			LogClientRequest(replica.ID, cmd, cmdID)
 			err := replica.Propose(cmd, cmdID)
-			val, _ := replica.KVStore.Get(cmd.Key)
 			if err != nil {
+				GetLogger().Error(CLIENT, "Error executing GET: %v", err)
 				fmt.Println("Error:", err)
 			} else {
-				fmt.Println("Value:", val)
+				// Wait a moment for execution to complete, then read the result
+				time.Sleep(100 * time.Millisecond)
+				val, ok := replica.KVStore.Get(cmd.Key)
+				if !ok {
+					fmt.Println("Value: <not found>")
+				} else {
+					fmt.Println("Value:", val)
+				}
 			}
 
+		case "exit", "quit":
+			GetLogger().Info(GENERAL, "Replica %d shutting down", *id)
+			fmt.Println("Goodbye!")
+			return
+
 		default:
-			fmt.Println("Unknown command")
+			fmt.Println("Unknown command. Available commands: put, get, exit")
 		}
 	}
 }
