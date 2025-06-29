@@ -149,9 +149,11 @@ func (g *DependencyGraph) StronglyConnectedComponents() [][]string {
 }
 
 // BuildDependencyGraph creates the dependency graph for a command starting from the given instance
+// NOTE: This method assumes the caller already holds the appropriate lock
 func (r *Replica) BuildDependencyGraph(replicaID, instanceID int) *DependencyGraph {
-	r.InstanceLock.RLock()
-	defer r.InstanceLock.RUnlock()
+	// FIXED: Removed lock acquisition since caller (TryExecute) already holds the lock
+	// r.InstanceLock.RLock()
+	// defer r.InstanceLock.RUnlock()
 
 	graph := NewDependencyGraph()
 	visited := make(map[string]bool)
@@ -249,7 +251,7 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 		return false
 	}
 
-	// Step 1: Build dependency graph
+	// Step 1: Build dependency graph (lock already held)
 	graph := r.BuildDependencyGraph(replicaID, instanceID)
 
 	// Check if the target instance is in the graph

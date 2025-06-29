@@ -99,9 +99,13 @@ func main() {
 		GetLogger().Fatal(NETWORK, "Failed to start RPC server: %v", err)
 	}
 
-	// Background execution loop with worker pool to prevent goroutine explosion
+	// Improved background execution loop with better error handling
 	go func() {
-		for {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Collect instances to execute
 			replica.InstanceLock.RLock()
 			var instancesToExecute []struct{ rid, iid int }
 
@@ -114,12 +118,22 @@ func main() {
 			}
 			replica.InstanceLock.RUnlock()
 
-			// Execute instances (limit concurrent executions)
-			for _, inst := range instancesToExecute {
-				go replica.TryExecute(inst.rid, inst.iid)
-			}
+			// Execute instances with limited concurrency to avoid resource exhaustion
+			const maxConcurrentExecutions = 10
+			semaphore := make(chan struct{}, maxConcurrentExecutions)
 
-			time.Sleep(1 * time.Second)
+			for _, inst := range instancesToExecute {
+				semaphore <- struct{}{} // Acquire
+				go func(rid, iid int) {
+					defer func() { <-semaphore }() // Release
+					defer func() {
+						if r := recover(); r != nil {
+							GetLogger().Error(EXECUTION, "Panic in TryExecute for R%d.%d: %v", rid, iid, r)
+						}
+					}()
+					replica.TryExecute(rid, iid)
+				}(inst.rid, inst.iid)
+			}
 		}
 	}()
 
@@ -127,18 +141,23 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 	GetLogger().Info(CLIENT, "Replica is running. Type 'put key value' or 'get key':")
 	fmt.Println("Replica is running. Type 'put key value' or 'get key':")
+	fmt.Println("Commands: put <key> <value>, get <key>, status, exit")
 
 	for {
 		fmt.Print(">> ")
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+		input, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Printf("Error reading input: %v\n", err)
+			continue
+		}
 
+		input = strings.TrimSpace(input)
 		if input == "" {
 			continue
 		}
 
 		args := strings.Split(input, " ")
-		if len(args) < 2 {
+		if len(args) < 1 {
 			fmt.Println("Invalid command")
 			continue
 		}
@@ -156,43 +175,92 @@ func main() {
 			}
 			cmdID := CommandID{ClientID: "cli", SeqNum: time.Now().Nanosecond()}
 			LogClientRequest(replica.ID, cmd, cmdID)
+
+			start := time.Now()
 			err := replica.Propose(cmd, cmdID)
+			duration := time.Since(start)
+
 			if err != nil {
 				GetLogger().Error(CLIENT, "Error executing PUT: %v", err)
-				fmt.Println("Error:", err)
+				fmt.Printf("Error: %v\n", err)
 			} else {
-				fmt.Println("OK")
+				fmt.Printf("OK (took %v)\n", duration)
 			}
 
 		case "get":
+			if len(args) != 2 {
+				fmt.Println("Usage: get <key>")
+				continue
+			}
 			cmd := Command{
 				Type: CmdGet,
 				Key:  args[1],
 			}
 			cmdID := CommandID{ClientID: "cli", SeqNum: time.Now().Nanosecond()}
 			LogClientRequest(replica.ID, cmd, cmdID)
+
+			start := time.Now()
 			err := replica.Propose(cmd, cmdID)
+			duration := time.Since(start)
+
 			if err != nil {
 				GetLogger().Error(CLIENT, "Error executing GET: %v", err)
-				fmt.Println("Error:", err)
+				fmt.Printf("Error: %v\n", err)
 			} else {
 				// Wait a moment for execution to complete, then read the result
 				time.Sleep(100 * time.Millisecond)
 				val, ok := replica.KVStore.Get(cmd.Key)
 				if !ok {
-					fmt.Println("Value: <not found>")
+					fmt.Printf("Value: <not found> (took %v)\n", duration)
 				} else {
-					fmt.Println("Value:", val)
+					fmt.Printf("Value: %s (took %v)\n", val, duration)
 				}
 			}
+
+		case "status":
+			// Show replica status
+			replica.InstanceLock.RLock()
+			totalInstances := 0
+			committedInstances := 0
+			executedInstances := 0
+
+			for _, instMap := range replica.Instances {
+				for _, inst := range instMap {
+					if inst != nil {
+						totalInstances++
+						if inst.Committed {
+							committedInstances++
+						}
+						if inst.Executed {
+							executedInstances++
+						}
+					}
+				}
+			}
+			replica.InstanceLock.RUnlock()
+
+			fmt.Printf("Replica %d Status:\n", replica.ID)
+			fmt.Printf("  Total instances: %d\n", totalInstances)
+			fmt.Printf("  Committed instances: %d\n", committedInstances)
+			fmt.Printf("  Executed instances: %d\n", executedInstances)
+			fmt.Printf("  KV Store size: %d keys\n", replica.KVStore.Size())
+			fmt.Printf("  Next instance ID: %d\n", replica.NextInstance)
 
 		case "exit", "quit":
 			GetLogger().Info(GENERAL, "Replica %d shutting down", *id)
 			fmt.Println("Goodbye!")
 			return
 
+		case "help":
+			fmt.Println("Available commands:")
+			fmt.Println("  put <key> <value> - Store a value")
+			fmt.Println("  get <key>         - Retrieve a value")
+			fmt.Println("  status            - Show replica status")
+			fmt.Println("  help              - Show this help")
+			fmt.Println("  exit/quit         - Exit the program")
+
 		default:
-			fmt.Println("Unknown command. Available commands: put, get, exit")
+			fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", args[0])
 		}
 	}
 }
