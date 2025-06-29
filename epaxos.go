@@ -482,7 +482,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	// Fast path: all replies agree and we have fast-path quorum
-	if same && okCount >= fastPathQuorum {
+	if same && okCount >= fastPathQuorum-1 {
 		LogFastPath()
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
