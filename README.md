@@ -246,12 +246,11 @@ Replicas can be configured with:
 - Replica ID: Unique identifier for the replica
 - Peers file: Configuration of all replicas in the cluster
 
-
-_______________________
+---
 
 # EPaxos Multi-Server Deployment Guide
 
-This guide explains how to deploy EPaxos across multiple servers using the provided deployment scripts.
+This guide explains how to deploy EPaxos across multiple servers using the provided deployment script.
 
 ## Architecture Overview
 
@@ -259,6 +258,7 @@ The deployment consists of:
 - **Multiple Servers**: Each server runs one EPaxos replica
 - **SSH Access**: All servers are accessed via SSH for deployment
 - **Configuration**: All server information is defined in `peers.txt`
+- **Unified Management**: Single script handles both setup validation and cluster deployment
 
 ## Prerequisites
 
@@ -304,97 +304,72 @@ Create or update `peers.txt` with your server configuration:
 15 192.168.1.25 8015
 ```
 
-### Step 2: Configure Scripts
+### Step 2: Configure the Script
 
-Update the configuration variables in the scripts:
+Update the configuration variables in `epaxos-manager.sh`:
 
-1. In `deploy.sh`:
+```bash
+DOCKER_IMAGE="your-dockerhub-username/epaxos:latest"
+SSH_KEY_PATH="~/.ssh/your-key.pem"
+```
+
+Update the `get_ssh_user()` function if you have different SSH users:
+```bash
+get_ssh_user() {
+    local server_ip=$1
+    
+    if [[ "$server_ip" == "localhost" || "$server_ip" == "127.0.0.1" ]]; then
+        echo "$USER"
+    else
+        echo "ubuntu"  # Change this to your SSH username
+    fi
+}
+```
+
+### Step 3: Run Setup and Deploy
+
+1. Make the script executable and run setup validation:
    ```bash
-   DOCKER_IMAGE="your-dockerhub-username/epaxos:latest"
-   SSH_KEY_PATH="~/.ssh/your-key.pem"
+   chmod +x epaxos-manager.sh
+   ./epaxos-manager.sh setup
    ```
 
-2. In `setup.sh`:
+2. Start the cluster:
    ```bash
-   DOCKER_IMAGE="your-dockerhub-username/epaxos:latest"
-   SSH_KEY_PATH="~/.ssh/your-key.pem"
+   ./epaxos-manager.sh start
    ```
 
-3. Update the `get_ssh_user()` function in both scripts if you have different SSH users:
+3. Check cluster status:
    ```bash
-   get_ssh_user() {
-       local server_ip=$1
-       
-       if [[ "$server_ip" == "localhost" || "$server_ip" == "127.0.0.1" ]]; then
-           echo "$USER"
-       else
-           echo "ubuntu"  # Change this to your SSH username
-       fi
-   }
+   ./epaxos-manager.sh status
    ```
 
-### Step 3: Run Setup and Tests
-
-1. Run the setup script to validate your configuration:
+4. View logs:
    ```bash
-   chmod +x setup.sh
-   ./setup.sh
+   ./epaxos-manager.sh logs
    ```
 
-2. Test network connectivity:
-   ```bash
-   chmod +x test-network.sh
-   ./test-network.sh
-   ```
+## Script Overview
 
-### Step 4: Deploy the Cluster
-
-1. Start all replicas:
-   ```bash
-   chmod +x deploy.sh
-   ./deploy.sh start
-   ```
-
-2. Check cluster status:
-   ```bash
-   ./deploy.sh status
-   ```
-
-3. View logs:
-   ```bash
-   ./deploy.sh logs
-   ```
-
-## Scripts Overview
-
-### `deploy.sh` - Main Deployment Script
+### `epaxos-manager.sh` - Unified Deployment Script
 
 **Commands:**
-- `./deploy.sh start` - Start all EPaxos replicas
-- `./deploy.sh stop` - Stop all replicas
-- `./deploy.sh restart` - Restart all replicas
-- `./deploy.sh status` - Check status of all replicas
-- `./deploy.sh logs` - Show logs from all replicas
-- `./deploy.sh logs <id>` - Show logs from specific replica
-- `./deploy.sh cleanup` - Remove all containers and images
-- `./deploy.sh validate` - Validate peers.txt format
+- `./epaxos-manager.sh setup` - Run complete setup validation (SSH, Docker, ports, etc.)
+- `./epaxos-manager.sh start` - Start all EPaxos replicas across all servers
+- `./epaxos-manager.sh stop` - Stop all replicas
+- `./epaxos-manager.sh restart` - Restart all replicas
+- `./epaxos-manager.sh status` - Check status of all replicas
+- `./epaxos-manager.sh logs` - Show logs from all replicas
+- `./epaxos-manager.sh logs <id>` - Show logs from specific replica
+- `./epaxos-manager.sh cleanup` - Remove all containers and images
+- `./epaxos-manager.sh validate` - Validate peers.txt format only
 
-### `setup.sh` - Setup and Validation Script
-
-**Features:**
+**Setup Validation Features:**
 - Validates peers.txt format
 - Tests SSH connectivity to all servers
 - Checks Docker installation
 - Tests Docker image pull
 - Checks port availability
-- Generates network test script
-
-### `test-network.sh` - Network Connectivity Test
-
-**Features:**
-- Tests connectivity between all replicas
-- Validates network configuration before deployment
-- Tests inter-server communication
 
 ### `peers.txt` - Server Configuration File
 
@@ -464,7 +439,7 @@ docker run -d \
 ### Check Cluster Status
 
 ```bash
-./deploy.sh status
+./epaxos-manager.sh status
 ```
 
 This shows the status of all containers across all servers.
@@ -473,19 +448,19 @@ This shows the status of all containers across all servers.
 
 View logs from all replicas:
 ```bash
-./deploy.sh logs
+./epaxos-manager.sh logs
 ```
 
 View logs from a specific replica:
 ```bash
-./deploy.sh logs 5  # View logs from replica 5
+./epaxos-manager.sh logs 5  # View logs from replica 5
 ```
 
 ### Validate Configuration
 
 Check if your `peers.txt` is properly formatted:
 ```bash
-./deploy.sh validate
+./epaxos-manager.sh validate
 ```
 
 ### Common Issues and Solutions
@@ -508,7 +483,7 @@ Check if your `peers.txt` is properly formatted:
 #### 4. Network Connectivity Issues
 - Verify firewall rules allow communication between servers
 - Check if all servers can reach each other on the required ports
-- Run `./test-network.sh` to diagnose connectivity issues
+- Run `./epaxos-manager.sh setup` to diagnose connectivity issues
 
 #### 5. Docker Image Pull Failed
 - Verify Docker Hub credentials if using private repository
@@ -519,14 +494,14 @@ Check if your `peers.txt` is properly formatted:
 - Ensure each line has exactly 3 fields: replica_id server_ip port
 - Check that replica IDs are unique and numeric
 - Verify ports are numeric and unique
-- Run `./deploy.sh validate` to check format
+- Run `./epaxos-manager.sh validate` to check format
 
 ### Cleanup
 
 To completely remove all EPaxos containers and images:
 
 ```bash
-./deploy.sh cleanup
+./epaxos-manager.sh cleanup
 ```
 
 ## Security Considerations
@@ -552,7 +527,7 @@ To completely remove all EPaxos containers and images:
 
 ### Resource Limits
 
-Add resource limits to the Docker run command in `deploy.sh`:
+Add resource limits to the Docker run command in `epaxos-manager.sh`:
 
 ```bash
 --memory=1g --cpus=2 \
@@ -587,10 +562,10 @@ cp peers.txt peers.txt.backup
 
 ### Recovery Procedure
 
-1. Stop all replicas: `./deploy.sh stop`
+1. Stop all replicas: `./epaxos-manager.sh stop`
 2. Restore `peers.txt` if needed
-3. Restart replicas: `./deploy.sh start`
-4. Verify cluster health: `./deploy.sh status`
+3. Restart replicas: `./epaxos-manager.sh start`
+4. Verify cluster health: `./epaxos-manager.sh status`
 
 ## Example Deployments
 
@@ -629,11 +604,10 @@ cp peers.txt peers.txt.backup
 
 ## Support
 
-For issues with the deployment scripts:
-1. Check the logs: `./deploy.sh logs`
-2. Verify configuration: `./setup.sh`
-3. Test network connectivity: `./test-network.sh`
-4. Validate peers.txt: `./deploy.sh validate`
-5. Check Docker and SSH connectivity manually
+For issues with the deployment script:
+1. Check the logs: `./epaxos-manager.sh logs`
+2. Verify configuration: `./epaxos-manager.sh setup`
+3. Validate peers.txt: `./epaxos-manager.sh validate`
+4. Check Docker and SSH connectivity manually
 
 For EPaxos-specific issues, refer to the main project documentation. 
