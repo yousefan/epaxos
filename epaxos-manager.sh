@@ -69,7 +69,7 @@ parse_peers_file() {
     echo "$server_ip:$server_port"
 }
 
-# Get SSH user for a server (you can customize this logic)
+# Get SSH user for a server
 get_ssh_user() {
     local server_ip=$1
     
@@ -77,7 +77,7 @@ get_ssh_user() {
     if [[ "$server_ip" == "localhost" || "$server_ip" == "127.0.0.1" ]]; then
         echo "$USER"
     else
-        # You can customize this based on your server naming convention
+        # Customize this based on your server naming convention
         echo "ubuntu"  # Default user - change as needed
     fi
 }

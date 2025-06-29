@@ -31,4 +31,4 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Use host network so each replica listens on the port in peers.txt
 #  (No EXPOSE needed when --network host is used)
-ENTRYPOINT ["docker-entrypoint.sh"]
+ENTRYPOINT ["epaxos-manager.sh"]
