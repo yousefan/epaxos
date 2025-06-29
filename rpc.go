@@ -5,12 +5,13 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"time"
 )
 
 // === RPC Argument and Reply Types ===
 
-// Put/Get request from clients
-type ClientRequest struct {
+// RPCClientRequest represents a client request over RPC
+type RPCClientRequest struct {
 	Command Command
 }
 
@@ -26,13 +27,40 @@ type ReplicaRPC struct {
 	Replica *Replica
 }
 
-func (r *ReplicaRPC) HandleClientCommand(req ClientRequest, reply *ClientReply) error {
-	switch req.Command.Type {
-	case CmdPut:
-		r.Replica.KVStore.Put(req.Command.Key, req.Command.Value)
-		reply.Success = true
+func (r *ReplicaRPC) HandleClientCommand(req RPCClientRequest, reply *ClientReply) error {
+	// Create a unique command ID for this request
+	cmdID := CommandID{
+		ClientID: "rpc_client",
+		SeqNum:   time.Now().Nanosecond(),
+	}
 
-	case CmdGet:
+	// Check for duplicate request
+	clientReq := &ClientRequest{
+		CommandID: cmdID,
+		Command:   req.Command,
+		Timestamp: time.Now(),
+	}
+
+	if !r.Replica.TrackClientRequest(clientReq) {
+		// Duplicate request - return cached result if available
+		if _, exists := r.Replica.GetClientRequest(cmdID); exists {
+			// TODO: Return cached result
+			reply.Success = true
+			reply.Error = "Duplicate request"
+			return nil
+		}
+	}
+
+	// Propose the command through EPaxos
+	err := r.Replica.Propose(req.Command, cmdID)
+	if err != nil {
+		reply.Success = false
+		reply.Error = fmt.Sprintf("Failed to propose command: %v", err)
+		return nil
+	}
+
+	// For GET commands, try to retrieve the value
+	if req.Command.Type == CmdGet {
 		val, ok := r.Replica.KVStore.Get(req.Command.Key)
 		if !ok {
 			reply.Success = false
@@ -41,10 +69,8 @@ func (r *ReplicaRPC) HandleClientCommand(req ClientRequest, reply *ClientReply) 
 			reply.Success = true
 			reply.Value = val
 		}
-
-	default:
-		reply.Success = false
-		reply.Error = "Unknown command type"
+	} else {
+		reply.Success = true
 	}
 
 	return nil
@@ -77,7 +103,7 @@ func SendClientCommand(address string, cmd Command) (*ClientReply, error) {
 	}
 	defer client.Close()
 
-	req := ClientRequest{Command: cmd}
+	req := RPCClientRequest{Command: cmd}
 	var reply ClientReply
 	err = client.Call("ReplicaRPC.HandleClientCommand", req, &reply)
 	if err != nil {

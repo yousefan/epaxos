@@ -2,7 +2,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -13,6 +12,18 @@ func formatDeps(deps []int) string {
 		return "[]"
 	}
 	return fmt.Sprintf("%v", deps)
+}
+
+// formatCrossReplicaDeps formats the cross-replica dependencies array for better readability
+func formatCrossReplicaDeps(deps []CrossReplicaDependency) string {
+	if len(deps) == 0 {
+		return "[]"
+	}
+	var result []string
+	for _, dep := range deps {
+		result = append(result, fmt.Sprintf("R%d.%d", dep.ReplicaID, dep.InstanceID))
+	}
+	return fmt.Sprintf("[%s]", strings.Join(result, ", "))
 }
 
 // formatCommand formats a Command for logging
@@ -60,9 +71,9 @@ func formatInstance(inst *EPaxosInstance) string {
 	builder.WriteString(fmt.Sprintf("Command: %s, ", formatCommand(inst.Command)))
 	builder.WriteString(fmt.Sprintf("ID: %s, ", formatCommandID(inst.CommandID)))
 	builder.WriteString(fmt.Sprintf("Seq: %d, ", inst.Seq))
-	builder.WriteString(fmt.Sprintf("Deps: %s, ", formatDeps(inst.Deps)))
+	builder.WriteString(fmt.Sprintf("Deps: %s, ", formatCrossReplicaDeps(inst.Deps)))
 	builder.WriteString(fmt.Sprintf("Status: %s, ", formatStatus(inst.Status)))
-	builder.WriteString(fmt.Sprintf("Ballot: %d, ", inst.Ballot))
+	builder.WriteString(fmt.Sprintf("Ballot: %d, ", inst.Ballot.Number))
 	builder.WriteString(fmt.Sprintf("Committed: %t, ", inst.Committed))
 	builder.WriteString(fmt.Sprintf("Executed: %t", inst.Executed))
 
@@ -124,18 +135,18 @@ func LogPreAcceptPhase(replicaID ReplicaID, instanceID int, command Command, cmd
 
 // LogPreAcceptResponse logs a response to a PreAccept request
 func LogPreAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID,
-	initialSeq, newSeq int, initialDeps, newDeps []int, success bool) {
+	initialSeq, newSeq int, initialDeps, newDeps []CrossReplicaDependency, success bool) {
 	if GetLogger() == nil {
 		return
 	}
 
 	if success {
-		if initialSeq != newSeq || !equalIntSlice(initialDeps, newDeps) {
+		if initialSeq != newSeq || !equalCrossReplicaDeps(initialDeps, newDeps) {
 			GetLogger().Info(PREACCEPT, "PreAccept for instance R%d.%d from R%d: CONFLICT | Seq: %d -> %d | Deps: %s -> %s",
-				replicaID, instanceID, fromReplica, initialSeq, newSeq, formatDeps(initialDeps), formatDeps(newDeps))
+				replicaID, instanceID, fromReplica, initialSeq, newSeq, formatCrossReplicaDeps(initialDeps), formatCrossReplicaDeps(newDeps))
 		} else {
 			GetLogger().Debug(PREACCEPT, "PreAccept for instance R%d.%d from R%d: OK | Seq: %d | Deps: %s",
-				replicaID, instanceID, fromReplica, newSeq, formatDeps(newDeps))
+				replicaID, instanceID, fromReplica, newSeq, formatCrossReplicaDeps(newDeps))
 		}
 	} else {
 		GetLogger().Warn(PREACCEPT, "PreAccept for instance R%d.%d from R%d: FAILED",
@@ -144,13 +155,13 @@ func LogPreAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica Repli
 }
 
 // LogAcceptPhase logs the beginning of an Accept phase
-func LogAcceptPhase(replicaID ReplicaID, instanceID int, seq int, deps []int, ballot int) {
+func LogAcceptPhase(replicaID ReplicaID, instanceID int, seq int, deps []CrossReplicaDependency, ballot int) {
 	if GetLogger() == nil {
 		return
 	}
 
 	GetLogger().Info(ACCEPT, "Starting Accept phase for instance R%d.%d | Seq: %d | Deps: %s | Ballot: %d",
-		replicaID, instanceID, seq, formatDeps(deps), ballot)
+		replicaID, instanceID, seq, formatCrossReplicaDeps(deps), ballot)
 }
 
 // LogAcceptResponse logs a response to an Accept request
@@ -169,13 +180,13 @@ func LogAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaI
 }
 
 // LogCommitPhase logs the beginning of a Commit phase
-func LogCommitPhase(replicaID ReplicaID, instanceID int, seq int, deps []int) {
+func LogCommitPhase(replicaID ReplicaID, instanceID int, seq int, deps []CrossReplicaDependency) {
 	if GetLogger() == nil {
 		return
 	}
 
 	GetLogger().Info(COMMIT, "Starting Commit phase for instance R%d.%d | Seq: %d | Deps: %s",
-		replicaID, instanceID, seq, formatDeps(deps))
+		replicaID, instanceID, seq, formatCrossReplicaDeps(deps))
 }
 
 // LogCommitResponse logs a response to a Commit request
@@ -245,14 +256,14 @@ func LogDependencyAdded(replicaID ReplicaID, instanceID int, depInstanceID int) 
 		replicaID, instanceID, depInstanceID)
 }
 
-// LogReplicaStart logs when a replica starts
+// LogReplicaStart logs replica startup information
 func LogReplicaStart(replicaID ReplicaID, address string, peers []string) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(REPLICA, "Replica R%d started at %s with peers: %v",
-		replicaID, address, peers)
+	GetLogger().Info(REPLICA, "Replica %d started on %s with %d peers: %v",
+		replicaID, address, len(peers), peers)
 }
 
 // LogClientRequest logs a client request
@@ -261,8 +272,8 @@ func LogClientRequest(replicaID ReplicaID, command Command, cmdID CommandID) {
 		return
 	}
 
-	GetLogger().Info(CLIENT, "Received client request on R%d | Command: %s | ID: %s",
-		replicaID, formatCommand(command), formatCommandID(cmdID))
+	GetLogger().Info(CLIENT, "Client request: %s | ID: %s | Replica: %d",
+		formatCommand(command), formatCommandID(cmdID), replicaID)
 }
 
 // LogRPCCall logs an outgoing RPC call
@@ -271,9 +282,8 @@ func LogRPCCall(replicaID ReplicaID, target string, method string, args interfac
 		return
 	}
 
-	argsJSON, _ := json.Marshal(args)
-	GetLogger().Debug(RPC, "R%d sending RPC to %s | Method: %s | Args: %s",
-		replicaID, target, method, string(argsJSON))
+	GetLogger().Debug(RPC, "RPC call from R%d to %s: %s | Args: %+v",
+		replicaID, target, method, args)
 }
 
 // LogRPCReceive logs an incoming RPC call
@@ -282,9 +292,8 @@ func LogRPCReceive(replicaID ReplicaID, method string, args interface{}) {
 		return
 	}
 
-	argsJSON, _ := json.Marshal(args)
-	GetLogger().Debug(RPC, "R%d received RPC | Method: %s | Args: %s",
-		replicaID, method, string(argsJSON))
+	GetLogger().Debug(RPC, "RPC receive on R%d: %s | Args: %+v",
+		replicaID, method, args)
 }
 
 // LogKVStoreOperation logs a key-value store operation
@@ -294,10 +303,10 @@ func LogKVStoreOperation(replicaID ReplicaID, operation string, key string, valu
 	}
 
 	if success {
-		GetLogger().Debug(STORAGE, "R%d KV operation: %s | Key: %s | Value: %s | Success: true",
-			replicaID, operation, key, value)
+		GetLogger().Debug(STORAGE, "KV Store operation: %s | Key: %s | Value: %s | Success: true",
+			operation, key, value)
 	} else {
-		GetLogger().Warn(STORAGE, "R%d KV operation: %s | Key: %s | Value: %s | Success: false | Error: %v",
-			replicaID, operation, key, value, err)
+		GetLogger().Error(STORAGE, "KV Store operation: %s | Key: %s | Error: %v",
+			operation, key, err)
 	}
 }

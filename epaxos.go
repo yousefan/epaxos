@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"net/rpc"
+	"time"
 )
 
 // === PreAccept Phase ===
@@ -12,13 +14,15 @@ type PreAcceptArgs struct {
 	Command    Command
 	CommandID  CommandID
 	Seq        int
-	Deps       []int
+	Deps       []CrossReplicaDependency
+	Ballot     Ballot
 }
 
 type PreAcceptReply struct {
-	OK   bool
-	Seq  int
-	Deps []int
+	OK     bool
+	Seq    int
+	Deps   []CrossReplicaDependency
+	Ballot Ballot
 }
 
 // === Commit Phase ===
@@ -29,7 +33,8 @@ type CommitArgs struct {
 	Command    Command
 	CommandID  CommandID
 	Seq        int
-	Deps       []int
+	Deps       []CrossReplicaDependency
+	Ballot     Ballot
 }
 
 type CommitReply struct {
@@ -44,13 +49,13 @@ type AcceptArgs struct {
 	Command    Command
 	CommandID  CommandID
 	Seq        int
-	Deps       []int
-	Ballot     int
+	Deps       []CrossReplicaDependency
+	Ballot     Ballot
 }
 
 type AcceptReply struct {
 	OK     bool
-	Ballot int
+	Ballot Ballot
 }
 
 // === ReplicaRPC Additions ===
@@ -61,15 +66,23 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 	r.Replica.InstanceLock.Lock()
 	defer r.Replica.InstanceLock.Unlock()
 
+	// Update ballot if necessary
+	if !r.Replica.UpdateBallot(args.Ballot) {
+		reply.OK = false
+		return nil
+	}
+
 	if _, ok := r.Replica.Instances[int(args.ReplicaID)]; !ok {
 		r.Replica.Instances[int(args.ReplicaID)] = make(map[int]*EPaxosInstance)
 	}
 
 	// === Conflict Detection ===
 	maxSeq := args.Seq
-	newDeps := make([]int, len(args.Deps))
+	newDeps := make([]CrossReplicaDependency, len(args.Deps))
 	copy(newDeps, args.Deps)
+	dependencySet := &DependencySet{}
 
+	// Check for conflicts across all replicas
 	for rid, instanceMap := range r.Replica.Instances {
 		for iid, inst := range instanceMap {
 			if inst == nil || inst.CommandID == args.CommandID {
@@ -82,9 +95,10 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 					maxSeq = inst.Seq + 1
 				}
 				// Add dependency on conflicting instance
+				dependencySet.AddDependency(ReplicaID(rid), iid)
 				if rid == int(r.Replica.ID) {
 					LogDependencyAdded(args.ReplicaID, args.InstanceID, iid)
-					newDeps = appendIfMissing(newDeps, iid)
+					newDeps = appendIfMissingCrossReplica(newDeps, CrossReplicaDependency{ReplicaID: ReplicaID(rid), InstanceID: iid})
 				}
 			}
 		}
@@ -92,11 +106,15 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 
 	// Save the instance
 	inst := &EPaxosInstance{
-		Command:   args.Command,
-		CommandID: args.CommandID,
-		Seq:       maxSeq,
-		Deps:      newDeps,
-		Status:    StatusPreAccepted,
+		Command:       args.Command,
+		CommandID:     args.CommandID,
+		Seq:           maxSeq,
+		Deps:          newDeps,
+		Status:        StatusPreAccepted,
+		Ballot:        args.Ballot,
+		Leader:        args.ReplicaID,
+		Quorum:        r.Replica.QuorumSize,
+		PreAcceptedBy: []ReplicaID{r.Replica.ID},
 	}
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 
@@ -104,6 +122,7 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 	reply.OK = true
 	reply.Seq = maxSeq
 	reply.Deps = newDeps
+	reply.Ballot = r.Replica.CurrentBallot
 
 	LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Seq, maxSeq, args.Deps, newDeps, reply.OK)
 
@@ -117,13 +136,21 @@ func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
 	if _, ok := r.Replica.Instances[int(args.ReplicaID)]; !ok {
 		r.Replica.Instances[int(args.ReplicaID)] = make(map[int]*EPaxosInstance)
 	}
+
+	// Update ballot if necessary
+	r.Replica.UpdateBallot(args.Ballot)
+
 	inst := &EPaxosInstance{
-		Command:   args.Command,
-		CommandID: args.CommandID,
-		Seq:       args.Seq,
-		Deps:      args.Deps,
-		Status:    StatusCommitted,
-		Committed: true,
+		Command:     args.Command,
+		CommandID:   args.CommandID,
+		Seq:         args.Seq,
+		Deps:        args.Deps,
+		Status:      StatusCommitted,
+		Committed:   true,
+		Ballot:      args.Ballot,
+		Leader:      args.ReplicaID,
+		Quorum:      r.Replica.QuorumSize,
+		CommittedBy: []ReplicaID{r.Replica.ID},
 	}
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 	r.Replica.InstanceLock.Unlock()
@@ -181,9 +208,48 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	r.NextInstance++
 	r.InstanceLock.Unlock()
 
+	// Check for duplicate client request
+	clientReq := &ClientRequest{
+		CommandID: cmdID,
+		Command:   command,
+		Timestamp: time.Now(),
+	}
+
+	if !r.TrackClientRequest(clientReq) {
+		GetLogger().Warn(CLIENT, "Duplicate client request detected: %s", formatCommandID(cmdID))
+		// Return existing result if available
+		if _, exists := r.GetClientRequest(cmdID); exists {
+			// TODO: Return cached result
+			return nil
+		}
+	}
+
+	// Try proposal with exponential backoff
+	maxRetries := 5
+	backoff := time.Millisecond * 100
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := r.tryPropose(command, cmdID, instanceID); err == nil {
+			return nil // Success
+		}
+
+		// Exponential backoff
+		time.Sleep(backoff)
+		backoff *= 2
+
+		GetLogger().Warn(CONSENSUS, "Proposal attempt %d failed, retrying with backoff %v", attempt+1, backoff)
+	}
+
+	return fmt.Errorf("failed to propose command after %d attempts", maxRetries)
+}
+
+func (r *Replica) tryPropose(command Command, cmdID CommandID, instanceID int) error {
+	// Generate ballot for this proposal
+	ballot := r.GetNextBallot()
+
 	// Initial guess
 	initialSeq := 1
-	initialDeps := []int{}
+	initialDeps := []CrossReplicaDependency{}
 
 	args := PreAcceptArgs{
 		ReplicaID:  r.ID,
@@ -192,16 +258,23 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		CommandID:  cmdID,
 		Seq:        initialSeq,
 		Deps:       initialDeps,
+		Ballot:     ballot,
 	}
 
-	type replyMeta struct {
-		Seq  int
-		Deps []int
-	}
-	replies := []replyMeta{}
+	replies := []struct {
+		Seq    int
+		Deps   []CrossReplicaDependency
+		Ballot Ballot
+		OK     bool
+	}{}
 
 	okCount := 1 // Include self
-	replies = append(replies, replyMeta{Seq: initialSeq, Deps: initialDeps})
+	replies = append(replies, struct {
+		Seq    int
+		Deps   []CrossReplicaDependency
+		Ballot Ballot
+		OK     bool
+	}{Seq: initialSeq, Deps: initialDeps, Ballot: ballot, OK: true})
 
 	// Send PreAccept to peers
 	for _, peer := range r.Peers {
@@ -212,7 +285,19 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 		if reply.OK {
 			okCount++
-			replies = append(replies, replyMeta{Seq: reply.Seq, Deps: reply.Deps})
+			replies = append(replies, struct {
+				Seq    int
+				Deps   []CrossReplicaDependency
+				Ballot Ballot
+				OK     bool
+			}{Seq: reply.Seq, Deps: reply.Deps, Ballot: reply.Ballot, OK: true})
+		} else {
+			replies = append(replies, struct {
+				Seq    int
+				Deps   []CrossReplicaDependency
+				Ballot Ballot
+				OK     bool
+			}{OK: false})
 		}
 	}
 
@@ -220,16 +305,14 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	same := true
 	base := replies[0]
 	for _, rep := range replies[1:] {
-		if rep.Seq != base.Seq || !equalIntSlice(rep.Deps, base.Deps) {
+		if !rep.OK || rep.Seq != base.Seq || !equalCrossReplicaDeps(rep.Deps, base.Deps) {
 			same = false
 			break
 		}
 	}
 
-	// Fast path: all replies agree
-	//TODO The acceptance rate should be dynamically obtained from the CLI or config file
-	if same && okCount > len(r.Peers)/2 {
-
+	// Fast path: all replies agree and we have a fast-path quorum
+	if same && okCount >= r.FastPathQuorum {
 		LogFastPath()
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
@@ -238,6 +321,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			CommandID:  cmdID,
 			Seq:        base.Seq,
 			Deps:       base.Deps,
+			Ballot:     ballot,
 		}
 		for _, peer := range r.Peers {
 			go SendCommitToPeer(peer, commitArgs)
@@ -249,43 +333,57 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			r.Instances[int(r.ID)] = make(map[int]*EPaxosInstance)
 		}
 		r.Instances[int(r.ID)][instanceID] = &EPaxosInstance{
-			Command:   command,
-			CommandID: cmdID,
-			Seq:       base.Seq,
-			Deps:      base.Deps,
-			Status:    StatusCommitted,
-			Committed: true,
+			Command:     command,
+			CommandID:   cmdID,
+			Seq:         base.Seq,
+			Deps:        base.Deps,
+			Status:      StatusCommitted,
+			Committed:   true,
+			Ballot:      ballot,
+			Leader:      r.ID,
+			Quorum:      r.QuorumSize,
+			CommittedBy: []ReplicaID{r.ID},
 		}
 		r.InstanceLock.Unlock()
 		return nil
 	}
 
-	// Slow path: send Accept
+	// Slow path: send Accept with retry logic
+	return r.trySlowPath(command, cmdID, instanceID, ballot, replies)
+}
+
+func (r *Replica) trySlowPath(command Command, cmdID CommandID, instanceID int, ballot Ballot, replies []struct {
+	Seq    int
+	Deps   []CrossReplicaDependency
+	Ballot Ballot
+	OK     bool
+}) error {
 	LogSlowPath()
-	maxSeq := base.Seq
-	for _, r := range replies {
-		if r.Seq > maxSeq {
-			maxSeq = r.Seq
+	maxSeq := replies[0].Seq
+	for _, rep := range replies {
+		if rep.OK && rep.Seq > maxSeq {
+			maxSeq = rep.Seq
 		}
 	}
 
 	mergedInput := make([]struct {
 		Seq  int
-		Deps []int
+		Deps []CrossReplicaDependency
 	}, len(replies))
 
-	for i, r := range replies {
-		mergedInput[i] = struct {
-			Seq  int
-			Deps []int
-		}{
-			Seq:  r.Seq,
-			Deps: r.Deps,
+	for i, rep := range replies {
+		if rep.OK {
+			mergedInput[i] = struct {
+				Seq  int
+				Deps []CrossReplicaDependency
+			}{
+				Seq:  rep.Seq,
+				Deps: rep.Deps,
+			}
 		}
 	}
 
-	allDeps := mergeDeps(mergedInput)
-	ballot := 1 // You can increment this per conflict
+	allDeps := mergeCrossReplicaDeps(mergedInput)
 
 	acceptArgs := AcceptArgs{
 		ReplicaID:  r.ID,
@@ -298,6 +396,8 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	ackCount := 1 // self
+	var nacks []Ballot
+
 	for _, peer := range r.Peers {
 		reply, err := SendAcceptToPeer(peer, acceptArgs)
 		if err != nil {
@@ -306,10 +406,13 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 		if reply.OK {
 			ackCount++
+		} else {
+			// Collect NACKs for potential re-proposal
+			nacks = append(nacks, reply.Ballot)
 		}
 	}
 
-	if ackCount > len(r.Peers)/2 {
+	if r.IsQuorum(ackCount) {
 		LogAcceptQuorum()
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
@@ -318,6 +421,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			CommandID:  cmdID,
 			Seq:        maxSeq,
 			Deps:       allDeps,
+			Ballot:     ballot,
 		}
 		for _, peer := range r.Peers {
 			go SendCommitToPeer(peer, commitArgs)
@@ -328,46 +432,93 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			r.Instances[int(r.ID)] = make(map[int]*EPaxosInstance)
 		}
 		r.Instances[int(r.ID)][instanceID] = &EPaxosInstance{
-			Command:   command,
-			CommandID: cmdID,
-			Seq:       maxSeq,
-			Deps:      allDeps,
-			Status:    StatusCommitted,
-			Committed: true,
+			Command:     command,
+			CommandID:   cmdID,
+			Seq:         maxSeq,
+			Deps:        allDeps,
+			Status:      StatusCommitted,
+			Committed:   true,
+			Ballot:      ballot,
+			Leader:      r.ID,
+			Quorum:      r.QuorumSize,
+			CommittedBy: []ReplicaID{r.ID},
 		}
 		r.InstanceLock.Unlock()
+		return nil
 	} else {
 		LogAcceptQuorumFailure()
-	}
 
-	return nil
+		// Update ballot based on NACKs
+		for _, nackBallot := range nacks {
+			if nackBallot.Less(r.CurrentBallot) {
+				r.UpdateBallot(nackBallot)
+			}
+		}
+
+		return fmt.Errorf("accept quorum not achieved")
+	}
 }
 
 func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
-	LogAcceptPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps, args.Ballot)
+	LogAcceptPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps, args.Ballot.Number)
 
 	r.Replica.InstanceLock.Lock()
 	defer r.Replica.InstanceLock.Unlock()
+
+	// Check if we have a higher ballot number
+	if !r.Replica.UpdateBallot(args.Ballot) {
+		// We have a higher ballot - NACK this request
+		reply.OK = false
+		reply.Ballot = r.Replica.CurrentBallot
+		GetLogger().Warn(ACCEPT, "NACK: Replica %d has higher ballot %v than request ballot %v",
+			r.Replica.ID, r.Replica.CurrentBallot, args.Ballot)
+		return nil
+	}
 
 	if _, ok := r.Replica.Instances[int(args.ReplicaID)]; !ok {
 		r.Replica.Instances[int(args.ReplicaID)] = make(map[int]*EPaxosInstance)
 	}
 
-	inst := &EPaxosInstance{
-		Command:   args.Command,
-		CommandID: args.CommandID,
-		Seq:       args.Seq,
-		Deps:      args.Deps,
-		Ballot:    args.Ballot,
-		Status:    StatusAccepted,
+	// Check if instance already exists with higher ballot
+	if existingInst, exists := r.Replica.Instances[int(args.ReplicaID)][args.InstanceID]; exists {
+		if existingInst.Ballot.Less(args.Ballot) {
+			// Update existing instance with new ballot
+			existingInst.Ballot = args.Ballot
+			existingInst.Command = args.Command
+			existingInst.CommandID = args.CommandID
+			existingInst.Seq = args.Seq
+			existingInst.Deps = args.Deps
+			existingInst.Status = StatusAccepted
+			existingInst.Leader = args.ReplicaID
+			existingInst.AcceptedBy = append(existingInst.AcceptedBy, r.Replica.ID)
+		} else if args.Ballot.Less(existingInst.Ballot) {
+			// Request has lower ballot - NACK
+			reply.OK = false
+			reply.Ballot = existingInst.Ballot
+			GetLogger().Warn(ACCEPT, "NACK: Instance R%d.%d has higher ballot %v than request ballot %v",
+				args.ReplicaID, args.InstanceID, existingInst.Ballot, args.Ballot)
+			return nil
+		}
+	} else {
+		// Create new instance
+		inst := &EPaxosInstance{
+			Command:    args.Command,
+			CommandID:  args.CommandID,
+			Seq:        args.Seq,
+			Deps:       args.Deps,
+			Ballot:     args.Ballot,
+			Status:     StatusAccepted,
+			Leader:     args.ReplicaID,
+			Quorum:     r.Replica.QuorumSize,
+			AcceptedBy: []ReplicaID{r.Replica.ID},
+		}
+		r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 	}
 
-	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
-
 	reply.OK = true
-	reply.Ballot = args.Ballot
+	reply.Ballot = r.Replica.CurrentBallot
 
-	LogAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Ballot, reply.OK)
+	LogAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Ballot.Number, reply.OK)
 
 	return nil
 }
