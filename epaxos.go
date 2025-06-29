@@ -19,10 +19,11 @@ type PreAcceptArgs struct {
 }
 
 type PreAcceptReply struct {
-	OK     bool
-	Seq    int
-	Deps   []Dependency
-	Ballot Ballot
+	OK                  bool
+	Seq                 int
+	Deps                []Dependency
+	Ballot              Ballot
+	AttributesUnchanged bool // NEW: Track if this reply didn't change attributes
 }
 
 // === Commit Phase ===
@@ -119,14 +120,18 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 		}
 	}
 
+	// NEW: Check if attributes were changed from the leader's proposal
+	attributesUnchanged := (maxSeq == args.Seq && equalDependencySlice(newDeps, args.Deps))
+
 	// Save the instance
 	inst := &EPaxosInstance{
-		Command:   args.Command,
-		CommandID: args.CommandID,
-		Seq:       maxSeq,
-		Deps:      newDeps,
-		Status:    StatusPreAccepted,
-		Ballot:    args.Ballot,
+		Command:             args.Command,
+		CommandID:           args.CommandID,
+		Seq:                 maxSeq,
+		Deps:                newDeps,
+		Status:              StatusPreAccepted,
+		Ballot:              args.Ballot,
+		AttributesUnchanged: attributesUnchanged, // NEW: Mark if unchanged
 	}
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 
@@ -135,6 +140,7 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 	reply.Seq = maxSeq
 	reply.Deps = newDeps
 	reply.Ballot = args.Ballot
+	reply.AttributesUnchanged = attributesUnchanged // NEW: Include in reply
 
 	LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Seq, maxSeq, convertDepsToIntSlice(args.Deps), convertDepsToIntSlice(newDeps), reply.OK)
 
@@ -434,13 +440,16 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	replies := []PreAcceptReply{}
-	okCount := 1 // Include self
+	okCount := 1        // Include self
+	unchangedCount := 1 // Self is always "unchanged" relative to local computation
+
 	// Add self reply with local conflict detection results
 	replies = append(replies, PreAcceptReply{
-		OK:     true,
-		Seq:    localSeq,
-		Deps:   localDeps,
-		Ballot: ballot,
+		OK:                  true,
+		Seq:                 localSeq,
+		Deps:                localDeps,
+		Ballot:              ballot,
+		AttributesUnchanged: true, // Self always unchanged
 	})
 
 	// Save the instance locally
@@ -449,16 +458,17 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		r.Instances[int(r.ID)] = make(map[int]*EPaxosInstance)
 	}
 	r.Instances[int(r.ID)][instanceID] = &EPaxosInstance{
-		Command:   command,
-		CommandID: cmdID,
-		Seq:       localSeq,
-		Deps:      localDeps,
-		Status:    StatusPreAccepted,
-		Ballot:    ballot,
+		Command:             command,
+		CommandID:           cmdID,
+		Seq:                 localSeq,
+		Deps:                localDeps,
+		Status:              StatusPreAccepted,
+		Ballot:              ballot,
+		AttributesUnchanged: true, // Leader's initial proposal is always "unchanged"
 	}
 	r.InstanceLock.Unlock()
 
-	// Send PreAccept to peers
+	// Send PreAccept to ALL peers (redundant PreAccepts)
 	for _, peer := range r.Peers {
 		reply, err := SendPreAcceptToPeer(peer, args)
 		if err != nil {
@@ -468,10 +478,13 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		if reply.OK {
 			okCount++
 			replies = append(replies, *reply)
+			if reply.AttributesUnchanged {
+				unchangedCount++
+			}
 		}
 	}
 
-	// Analyze replies
+	// Analyze replies for fast path
 	same := true
 	base := replies[0]
 	for _, rep := range replies[1:] {
@@ -481,8 +494,12 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 	}
 
-	// Fast path: all replies agree and we have fast-path quorum
-	if same && okCount >= fastPathQuorum-1 {
+	// NEW: Enhanced fast path condition for redundant PreAccepts
+	// We need F + ⌈(F+1)/2⌉ - 1 replies that match AND are unchanged
+	canUseFastPath := same && unchangedCount >= fastPathQuorum
+
+	if canUseFastPath {
+		GetLogger().Info(CONSENSUS, "Fast path with redundant PreAccepts: %d unchanged replies out of %d total (need %d)", unchangedCount, okCount, fastPathQuorum-1)
 		LogFastPath()
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
@@ -511,6 +528,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 
 	// Slow path: send Accept
+	GetLogger().Info(CONSENSUS, "Slow path: only %d unchanged replies, need %d", unchangedCount, fastPathQuorum-1)
 	LogSlowPath()
 	maxSeq := getMaxSeq(replies)
 	allDeps := mergeDependencies(replies)
@@ -574,7 +592,34 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	return nil
 }
 
-// ExplicitPrepare implements the recovery protocol from Figure 3
+// NEW: Helper function to filter instances that have unchanged attributes
+func filterUnchangedInstances(replies []*PrepareReply) []*PrepareReply {
+	var filtered []*PrepareReply
+	for _, reply := range replies {
+		if reply.Instance != nil && reply.Instance.AttributesUnchanged {
+			filtered = append(filtered, reply)
+		}
+	}
+	return filtered
+}
+
+// NEW: Check if all unchanged instances have identical attributes
+func allUnchangedInstancesMatch(unchangedReplies []*PrepareReply) bool {
+	if len(unchangedReplies) <= 1 {
+		return true
+	}
+
+	base := unchangedReplies[0].Instance
+	for _, reply := range unchangedReplies[1:] {
+		inst := reply.Instance
+		if inst.Seq != base.Seq || !equalDependencySlice(inst.Deps, base.Deps) {
+			return false
+		}
+	}
+	return true
+}
+
+// ExplicitPrepare implements the recovery protocol from Figure 3 with redundant PreAccepts support
 func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 	r.InstanceLock.Lock()
 	ballot := Ballot{
@@ -609,6 +654,7 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 
 	f := len(r.Peers) / 2
 	if okCount < f+1 {
+		GetLogger().Warn(CONSENSUS, "Recovery failed: insufficient Prepare replies (%d, need %d)", okCount, f+1)
 		return nil // Cannot proceed without majority
 	}
 
@@ -631,6 +677,7 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 
 	if committed && highestInstance != nil {
 		// Instance is already committed, just commit locally
+		GetLogger().Info(CONSENSUS, "Recovery: Instance R%d.%d already committed", replicaID, instanceID)
 		commitArgs := CommitArgs{
 			ReplicaID:  ReplicaID(replicaID),
 			InstanceID: instanceID,
@@ -660,8 +707,60 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		for _, peer := range r.Peers {
 			go SendCommitToPeer(peer, commitArgs)
 		}
-	} else if highestInstance != nil {
-		// Run Accept phase for the highest instance found
+		return nil
+	}
+
+	if highestInstance != nil {
+		// NEW: Check if this could have been committed on fast path with redundant PreAccepts
+		unchangedReplies := filterUnchangedInstances(replies)
+		fastPathQuorum := f + (f+1+1)/2 // F + ⌈(F+1)/2⌉
+
+		GetLogger().Info(CONSENSUS, "Recovery: Found %d unchanged replies out of %d total (need %d for fast-path)",
+			len(unchangedReplies), len(replies), fastPathQuorum-1)
+
+		// If we have enough unchanged replies with identical attributes,
+		// this instance could have been fast-path committed
+		if len(unchangedReplies) >= fastPathQuorum-1 && allUnchangedInstancesMatch(unchangedReplies) {
+			GetLogger().Info(CONSENSUS, "Recovery: Fast-path committing R%d.%d based on unchanged replies", replicaID, instanceID)
+
+			// This instance was likely fast-path committed, commit directly
+			commitArgs := CommitArgs{
+				ReplicaID:  ReplicaID(replicaID),
+				InstanceID: instanceID,
+				Command:    highestInstance.Command,
+				CommandID:  highestInstance.CommandID,
+				Seq:        highestInstance.Seq,
+				Deps:       highestInstance.Deps,
+				Ballot:     ballot,
+			}
+
+			// Update local state first
+			r.InstanceLock.Lock()
+			if _, ok := r.Instances[replicaID]; !ok {
+				r.Instances[replicaID] = make(map[int]*EPaxosInstance)
+			}
+			r.Instances[replicaID][instanceID] = &EPaxosInstance{
+				Command:   highestInstance.Command,
+				CommandID: highestInstance.CommandID,
+				Seq:       highestInstance.Seq,
+				Deps:      highestInstance.Deps,
+				Status:    StatusCommitted,
+				Committed: true,
+				Ballot:    ballot,
+			}
+			r.InstanceLock.Unlock()
+
+			// Notify other replicas
+			for _, peer := range r.Peers {
+				go SendCommitToPeer(peer, commitArgs)
+			}
+			return nil
+		}
+
+		// Fall back to Accept phase for regular recovery
+		GetLogger().Info(CONSENSUS, "Recovery: Using Accept phase for R%d.%d (insufficient unchanged replies: %d, need %d)",
+			replicaID, instanceID, len(unchangedReplies), fastPathQuorum-1)
+
 		acceptArgs := AcceptArgs{
 			ReplicaID:  ReplicaID(replicaID),
 			InstanceID: instanceID,
@@ -676,6 +775,7 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		for _, peer := range r.Peers {
 			reply, err := SendAcceptToPeer(peer, acceptArgs)
 			if err != nil {
+				GetLogger().Error(CONSENSUS, "Accept to %s failed during recovery: %v", peer, err)
 				continue
 			}
 			if reply.OK {
@@ -684,6 +784,8 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		}
 
 		if ackCount >= f+1 {
+			GetLogger().Info(CONSENSUS, "Recovery: Accept quorum achieved for R%d.%d, committing", replicaID, instanceID)
+
 			// Commit the instance
 			commitArgs := CommitArgs{
 				ReplicaID:  ReplicaID(replicaID),
@@ -695,12 +797,34 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 				Ballot:     ballot,
 			}
 
+			// Update local state
+			r.InstanceLock.Lock()
+			if _, ok := r.Instances[replicaID]; !ok {
+				r.Instances[replicaID] = make(map[int]*EPaxosInstance)
+			}
+			r.Instances[replicaID][instanceID] = &EPaxosInstance{
+				Command:   highestInstance.Command,
+				CommandID: highestInstance.CommandID,
+				Seq:       highestInstance.Seq,
+				Deps:      highestInstance.Deps,
+				Status:    StatusCommitted,
+				Committed: true,
+				Ballot:    ballot,
+			}
+			r.InstanceLock.Unlock()
+
+			// Notify other replicas
 			for _, peer := range r.Peers {
 				go SendCommitToPeer(peer, commitArgs)
 			}
+		} else {
+			GetLogger().Warn(CONSENSUS, "Recovery: Accept quorum failed for R%d.%d (%d acks, need %d)",
+				replicaID, instanceID, ackCount, f+1)
 		}
 	} else {
 		// No instance found, commit no-op
+		GetLogger().Info(CONSENSUS, "Recovery: No instance found for R%d.%d, committing no-op", replicaID, instanceID)
+
 		noOpCommand := Command{Type: CmdGet, Key: "__noop__", Value: ""}
 		noOpCmdID := CommandID{ClientID: "system", SeqNum: instanceID}
 
@@ -714,6 +838,23 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 			Ballot:     ballot,
 		}
 
+		// Update local state
+		r.InstanceLock.Lock()
+		if _, ok := r.Instances[replicaID]; !ok {
+			r.Instances[replicaID] = make(map[int]*EPaxosInstance)
+		}
+		r.Instances[replicaID][instanceID] = &EPaxosInstance{
+			Command:   noOpCommand,
+			CommandID: noOpCmdID,
+			Seq:       0,
+			Deps:      []Dependency{},
+			Status:    StatusCommitted,
+			Committed: true,
+			Ballot:    ballot,
+		}
+		r.InstanceLock.Unlock()
+
+		// Notify other replicas
 		for _, peer := range r.Peers {
 			go SendCommitToPeer(peer, commitArgs)
 		}

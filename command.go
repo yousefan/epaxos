@@ -12,6 +12,10 @@ type EPaxosInstance struct {
 	Executed  bool      // True if the command has been applied
 	Timestamp Timestamp // Logical time for ordering
 	Leader    bool      // Whether this replica is the leader for the instance
+
+	// NEW: Track if this replica's PreAccept reply left attributes unchanged
+	// This is crucial for redundant PreAccepts recovery protocol
+	AttributesUnchanged bool // True if PreAccept didn't modify seq/deps from leader's proposal
 }
 
 // HasDependency checks if this instance depends on another instance
