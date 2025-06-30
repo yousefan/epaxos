@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -137,66 +140,42 @@ func main() {
 		}
 	}()
 
-	// REPL to simulate client commands
-	reader := bufio.NewReader(os.Stdin)
-	GetLogger().Info(CLIENT, "Replica is running. Type 'put key value' or 'get key':")
-	fmt.Println("Replica is running. Type 'put key value' or 'get key':")
-	fmt.Println("Commands: put <key> <value>, get <key>, status, exit")
-
-	for {
-		fmt.Print(">> ")
-		input, err := reader.ReadString('\n')
-		if err != nil {
-			fmt.Printf("Error reading input: %v\n", err)
-			continue
-		}
-
-		input = strings.TrimSpace(input)
-		if input == "" {
-			continue
-		}
-
-		args := strings.Split(input, " ")
-		if len(args) < 1 {
-			fmt.Println("Invalid command")
-			continue
-		}
-
-		switch args[0] {
-		case "put":
-			if len(args) != 3 {
-				fmt.Println("Usage: put <key> <value>")
-				continue
-			}
-			cmd := Command{
-				Type:  CmdPut,
-				Key:   args[1],
-				Value: args[2],
-			}
-			cmdID := CommandID{ClientID: "cli", SeqNum: time.Now().Nanosecond()}
-			LogClientRequest(replica.ID, cmd, cmdID)
-
-			start := time.Now()
-			err := replica.Propose(cmd, cmdID)
-			duration := time.Since(start)
-
-			if err != nil {
-				GetLogger().Error(CLIENT, "Error executing PUT: %v", err)
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				fmt.Printf("OK (took %v)\n", duration)
+	// Start HTTP server instead of REPL
+	go func() {
+		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "GET" {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
 			}
 
-		case "get":
-			if len(args) != 2 {
-				fmt.Println("Usage: get <key>")
-				continue
+			response := map[string]interface{}{
+				"replica_id": replica.ID,
+				"address":    thisAddr,
+				"peers":      peers,
+				"status":     "running",
 			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+		})
+
+		http.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "GET" {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+
+			key := r.URL.Query().Get("key")
+			if key == "" {
+				http.Error(w, "Missing key parameter", http.StatusBadRequest)
+				return
+			}
+
 			cmd := Command{
 				Type: CmdGet,
-				Key:  args[1],
+				Key:  key,
 			}
-			cmdID := CommandID{ClientID: "cli", SeqNum: time.Now().Nanosecond()}
+			cmdID := CommandID{ClientID: "http", SeqNum: time.Now().Nanosecond()}
 			LogClientRequest(replica.ID, cmd, cmdID)
 
 			start := time.Now()
@@ -205,62 +184,99 @@ func main() {
 
 			if err != nil {
 				GetLogger().Error(CLIENT, "Error executing GET: %v", err)
-				fmt.Printf("Error: %v\n", err)
-			} else {
-				// Wait a moment for execution to complete, then read the result
-				time.Sleep(100 * time.Millisecond)
-				val, ok := replica.KVStore.Get(cmd.Key)
-				if !ok {
-					fmt.Printf("Value: <not found> (took %v)\n", duration)
-				} else {
-					fmt.Printf("Value: %s (took %v)\n", val, duration)
-				}
+				http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+				return
 			}
 
-		case "status":
-			// Show replica status
-			replica.InstanceLock.RLock()
-			totalInstances := 0
-			committedInstances := 0
-			executedInstances := 0
+			// Wait a moment for execution to complete, then read the result
+			time.Sleep(100 * time.Millisecond)
+			val, ok := replica.KVStore.Get(cmd.Key)
 
-			for _, instMap := range replica.Instances {
-				for _, inst := range instMap {
-					if inst != nil {
-						totalInstances++
-						if inst.Committed {
-							committedInstances++
-						}
-						if inst.Executed {
-							executedInstances++
-						}
-					}
-				}
+			response := map[string]interface{}{
+				"key":      key,
+				"found":    ok,
+				"duration": duration.String(),
 			}
-			replica.InstanceLock.RUnlock()
 
-			fmt.Printf("Replica %d Status:\n", replica.ID)
-			fmt.Printf("  Total instances: %d\n", totalInstances)
-			fmt.Printf("  Committed instances: %d\n", committedInstances)
-			fmt.Printf("  Executed instances: %d\n", executedInstances)
-			fmt.Printf("  KV Store size: %d keys\n", replica.KVStore.Size())
-			fmt.Printf("  Next instance ID: %d\n", replica.NextInstance)
+			if ok {
+				response["value"] = val
+			}
 
-		case "exit", "quit":
-			GetLogger().Info(GENERAL, "Replica %d shutting down", *id)
-			fmt.Println("Goodbye!")
-			return
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+		})
 
-		case "help":
-			fmt.Println("Available commands:")
-			fmt.Println("  put <key> <value> - Store a value")
-			fmt.Println("  get <key>         - Retrieve a value")
-			fmt.Println("  status            - Show replica status")
-			fmt.Println("  help              - Show this help")
-			fmt.Println("  exit/quit         - Exit the program")
+		http.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != "POST" {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
 
-		default:
-			fmt.Printf("Unknown command: %s. Type 'help' for available commands.\n", args[0])
+			key := r.FormValue("key")
+			value := r.FormValue("value")
+
+			if key == "" || value == "" {
+				http.Error(w, "Missing key or value parameter", http.StatusBadRequest)
+				return
+			}
+
+			cmd := Command{
+				Type:  CmdPut,
+				Key:   key,
+				Value: value,
+			}
+			cmdID := CommandID{ClientID: "http", SeqNum: time.Now().Nanosecond()}
+			LogClientRequest(replica.ID, cmd, cmdID)
+
+			start := time.Now()
+			err := replica.Propose(cmd, cmdID)
+			duration := time.Since(start)
+
+			if err != nil {
+				GetLogger().Error(CLIENT, "Error executing PUT: %v", err)
+				http.Error(w, fmt.Sprintf("Error: %v", err), http.StatusInternalServerError)
+				return
+			}
+
+			response := map[string]interface{}{
+				"key":      key,
+				"value":    value,
+				"status":   "success",
+				"duration": duration.String(),
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(response)
+		})
+
+		// Extract port from thisAddr for HTTP server
+		parts := strings.Split(thisAddr, ":")
+		httpPort := "8080" // default
+		if len(parts) == 2 {
+			// Use RPC port + 1000 for HTTP server
+			rpcPort := parts[1]
+			if port, err := strconv.Atoi(rpcPort); err == nil {
+				httpPort = strconv.Itoa(port + 1000)
+			}
 		}
-	}
+
+		httpAddr := fmt.Sprintf(":%s", httpPort)
+		GetLogger().Info(CLIENT, "Starting HTTP server on %s", httpAddr)
+		fmt.Printf("HTTP server starting on %s\n", httpAddr)
+
+		if err := http.ListenAndServe(httpAddr, nil); err != nil {
+			GetLogger().Fatal(NETWORK, "Failed to start HTTP server: %v", err)
+		}
+	}()
+
+	// Keep the main goroutine alive
+	GetLogger().Info(GENERAL, "Replica %d is running with HTTP server", *id)
+	fmt.Printf("Replica %d is running. HTTP endpoints:\n", *id)
+	fmt.Printf("  GET  / - Server info\n")
+	fmt.Printf("  GET  /get?key=<key> - Get value\n")
+	fmt.Printf("  POST /put - Put key/value (form data)\n")
+	fmt.Println("Press Ctrl+C to exit")
+
+	// Block forever (or until interrupted)
+	select {}
 }
