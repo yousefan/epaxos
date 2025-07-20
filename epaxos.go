@@ -413,8 +413,8 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	r.InstanceLock.Unlock()
 
 	// Calculate proper fast-path quorum size: F + ⌈(F+1)/2⌉
-	f := len(r.Peers) / 2           // Number of tolerated failures
-	fastPathQuorum := f + (f+1+1)/2 // ⌈(F+1)/2⌉ = (F+1+1)/2 for integer division
+	f := len(r.Peers) / 2         // Number of tolerated failures
+	fastPathQuorum := f + (f+1)/2 // ⌈(F+1)/2⌉ = (F+1+1)/2 for integer division
 
 	// Initial guess
 	initialSeq := 1
@@ -713,7 +713,7 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 	if highestInstance != nil {
 		// NEW: Check if this could have been committed on fast path with redundant PreAccepts
 		unchangedReplies := filterUnchangedInstances(replies)
-		fastPathQuorum := f + (f+1+1)/2 // F + ⌈(F+1)/2⌉
+		fastPathQuorum := f + (f+1)/2 // F + ⌈(F+1)/2⌉
 
 		GetLogger().Info(CONSENSUS, "Recovery: Found %d unchanged replies out of %d total (need %d for fast-path)",
 			len(unchangedReplies), len(replies), fastPathQuorum-1)
