@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -139,8 +140,30 @@ func (l *EPaxosLogger) formatLogMessage(level LogLevel, category LogCategory, fo
 		fileInfo = fmt.Sprintf("%s:%d", file, line)
 	}
 
-	return fmt.Sprintf("[%s] [%s] [R%d] [%s] [%s] %s",
-		timestamp, level.String(), l.replicaID, category, fileInfo, message)
+	entry := struct {
+		Timestamp string    `json:"timestamp"`
+		Level     string    `json:"level"`
+		ReplicaID ReplicaID `json:"replica_id"`
+		Category  string    `json:"category"`
+		File      string    `json:"file,omitempty"`
+		Message   string    `json:"message"`
+	}{
+		Timestamp: timestamp,
+		Level:     level.String(),
+		ReplicaID: l.replicaID,
+		Category:  string(category),
+		File:      fileInfo,
+		Message:   message,
+	}
+
+	b, err := json.Marshal(entry)
+	if err != nil {
+		// Fallback to plain formatting if JSON marshaling fails
+		return fmt.Sprintf("[%s] [%s] [R%d] [%s] [%s] %s",
+			timestamp, level.String(), l.replicaID, category, fileInfo, message)
+	}
+
+	return string(b)
 }
 
 // log logs a message with the given level and category
