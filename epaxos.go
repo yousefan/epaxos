@@ -561,9 +561,9 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			}
 
 			// Log successful PreAccept response with detailed analysis
-			//LogPreAcceptResponse(r.ID, instanceID, ReplicaID(i),
-			//	localSeq, reply.Seq, localDeps, reply.Deps,
-			//	true, reply.AttributesUnchanged)
+			LogPreAcceptResponse(r.ID, instanceID, ReplicaID(i),
+				localSeq, reply.Seq, localDeps, reply.Deps,
+				true, reply.AttributesUnchanged)
 
 		} else {
 			LogPreAcceptResponse(r.ID, instanceID, ReplicaID(i),
