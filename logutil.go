@@ -119,14 +119,14 @@ func LogCommitResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaI
 
 // === Consensus Decision Logging ===
 
-func LogFastPath(replicaID ReplicaID, instanceID int, quorumSize, unchanged int, command Command, cmdID CommandID) {
+func LogFastPath(replicaID ReplicaID, instanceID int, quorumSize, received int, unchanged int, command Command, cmdID CommandID) {
 	if GetLogger() == nil {
 		return
 	}
 
 	GetLogger().Log(INFO, CONSENSUS, "Fast path consensus achieved").
 		WithInstance(int(replicaID), instanceID).
-		WithQuorum(quorumSize, quorumSize, unchanged).
+		WithQuorum(quorumSize, received, unchanged).
 		WithFastPath(true).
 		WithCommand(command, cmdID).
 		WithTags("fast_path", "consensus", "optimization").
@@ -220,28 +220,28 @@ func LogExecutionAttempt(replicaID ReplicaID, instanceID int, instance *EPaxosIn
 	logger.WithTags("execution", "attempt").Send()
 }
 
-func LogExecutionSuccess(replicaID ReplicaID, instanceID int, command Command, result string, duration time.Duration) {
+func LogExecutionSuccess(replicaID ReplicaID, instanceID int, command Command, cmdID CommandID, result string, duration time.Duration) {
 	if GetLogger() == nil {
 		return
 	}
 
 	GetLogger().Log(INFO, EXECUTION, "Instance executed successfully").
 		WithInstance(int(replicaID), instanceID).
-		WithCommand(command, CommandID{}).
+		WithCommand(command, cmdID).
 		WithContext("result", result).
 		WithDuration(duration).
 		WithTags("execution", "success").
 		Send()
 }
 
-func LogExecutionFailure(replicaID ReplicaID, instanceID int, command Command, err error) {
+func LogExecutionFailure(replicaID ReplicaID, instanceID int, command Command, cmdID CommandID, err error) {
 	if GetLogger() == nil {
 		return
 	}
 
 	GetLogger().Log(ERROR, EXECUTION, "Instance execution failed").
 		WithInstance(int(replicaID), instanceID).
-		WithCommand(command, CommandID{}).
+		WithCommand(command, cmdID).
 		WithError(err, "execution_error").
 		WithTags("execution", "failure").
 		Send()

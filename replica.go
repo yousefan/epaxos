@@ -316,7 +316,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 		inst.Executed = true
 		inst.Status = StatusExecuted
 		totalDuration := time.Since(startTime)
-		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, "noop", totalDuration)
+		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, "noop", totalDuration)
 		return true
 	}
 
@@ -324,7 +324,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	//oldStatus := inst.Status
 	result, err := r.KVStore.ApplyCommand(inst.Command)
 	if err != nil {
-		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, err)
+		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, err)
 		return false
 	}
 
@@ -332,7 +332,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	inst.Status = StatusExecuted
 
 	totalDuration := time.Since(startTime)
-	LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, result, totalDuration)
+	LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, result, totalDuration)
 	//LogInstanceStateChange(ReplicaID(replicaID), instanceID, oldStatus, inst.Status, inst)
 	return true
 }

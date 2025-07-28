@@ -612,7 +612,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 		r.InstanceLock.Unlock()
 
-		LogFastPath(r.ID, instanceID, fastPathQuorum, unchangedCount, command, cmdID)
+		LogFastPath(r.ID, instanceID, fastPathQuorum, okCount, unchangedCount, command, cmdID)
 
 		return nil
 	}
