@@ -1,333 +1,679 @@
-// logutil.go
+// logutil.go - Enhanced structured logging utilities
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"strings"
+	"time"
 )
 
-// formatDeps formats the dependencies array for better readability
-func formatDeps(deps []int) string {
-	if len(deps) == 0 {
-		return "[]"
-	}
-	return fmt.Sprintf("%v", deps)
-}
+// === EPaxos Phase Logging ===
 
-// formatDependencies formats the new Dependency slice for better readability
-func formatDependencies(deps []Dependency) string {
-	if len(deps) == 0 {
-		return "[]"
-	}
-	var strs []string
-	for _, dep := range deps {
-		strs = append(strs, fmt.Sprintf("R%d.%d", dep.ReplicaID, dep.InstanceID))
-	}
-	return fmt.Sprintf("[%s]", strings.Join(strs, ", "))
-}
-
-// formatCommand formats a Command for logging
-func formatCommand(cmd Command) string {
-	switch cmd.Type {
-	case CmdGet:
-		return fmt.Sprintf("GET(%s)", cmd.Key)
-	case CmdPut:
-		return fmt.Sprintf("PUT(%s, %s)", cmd.Key, cmd.Value)
-	default:
-		return "UNKNOWN"
-	}
-}
-
-// formatCommandID formats a CommandID for logging
-func formatCommandID(cmdID CommandID) string {
-	return fmt.Sprintf("%s:%d", cmdID.ClientID, cmdID.SeqNum)
-}
-
-// formatStatus formats an InstanceStatus for logging
-func formatStatus(status InstanceStatus) string {
-	switch status {
-	case StatusNone:
-		return "NONE"
-	case StatusPreAccepted:
-		return "PRE-ACCEPTED"
-	case StatusAccepted:
-		return "ACCEPTED"
-	case StatusCommitted:
-		return "COMMITTED"
-	case StatusExecuted:
-		return "EXECUTED"
-	default:
-		return "UNKNOWN"
-	}
-}
-
-// formatBallot formats a Ballot for logging
-func formatBallot(ballot Ballot) string {
-	return fmt.Sprintf("%d.%d.%d", ballot.Epoch, ballot.Sequence, ballot.ReplicaID)
-}
-
-// formatInstance formats an EPaxosInstance for logging
-func formatInstance(inst *EPaxosInstance) string {
-	if inst == nil {
-		return "nil"
-	}
-
-	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("Command: %s, ", formatCommand(inst.Command)))
-	builder.WriteString(fmt.Sprintf("ID: %s, ", formatCommandID(inst.CommandID)))
-	builder.WriteString(fmt.Sprintf("Seq: %d, ", inst.Seq))
-	builder.WriteString(fmt.Sprintf("Deps: %s, ", formatDependencies(inst.Deps)))
-	builder.WriteString(fmt.Sprintf("Status: %s, ", formatStatus(inst.Status)))
-	builder.WriteString(fmt.Sprintf("Ballot: %s, ", formatBallot(inst.Ballot)))
-	builder.WriteString(fmt.Sprintf("Committed: %t, ", inst.Committed))
-	builder.WriteString(fmt.Sprintf("Executed: %t", inst.Executed))
-
-	return builder.String()
-}
-
-func LogFastPath() {
-	if GetLogger() == nil {
-		return
-	}
-
-	GetLogger().Info(COMMIT, "Fast path: committing directly")
-}
-
-func LogSlowPath() {
-	if GetLogger() == nil {
-		return
-	}
-
-	GetLogger().Info(ACCEPT, "Slow path: sending Accept")
-}
-
-func LogAcceptQuorum() {
-	if GetLogger() == nil {
-		return
-	}
-
-	GetLogger().Info(ACCEPT, "Accept quorum achieved: committing")
-}
-
-// LogAcceptQuorumFailure logs that an Accept quorum was not achieved and the process will retry or abort
-func LogAcceptQuorumFailure() {
-	if GetLogger() == nil {
-		return
-	}
-
-	GetLogger().Warn(ACCEPT, "Accept quorum not achieved. Will retry or abort.")
-}
-
-// LogInstanceStateChange logs a change in an EPaxos instance's state
-func LogInstanceStateChange(replicaID ReplicaID, instanceID int, oldState, newState InstanceStatus, instance *EPaxosInstance) {
-	if GetLogger() == nil {
-		return
-	}
-
-	GetLogger().Info(CONSENSUS, "Instance R%d.%d state change: %s -> %s | %s",
-		replicaID, instanceID, formatStatus(oldState), formatStatus(newState), formatInstance(instance))
-}
-
-// LogPreAcceptPhase logs the beginning of a PreAccept phase
 func LogPreAcceptPhase(replicaID ReplicaID, instanceID int, command Command, cmdID CommandID) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(PREACCEPT, "Starting PreAccept phase for instance R%d.%d | Command: %s | ID: %s",
-		replicaID, instanceID, formatCommand(command), formatCommandID(cmdID))
+	GetLogger().Log(INFO, PREACCEPT, "Starting PreAccept phase").
+		WithInstance(int(replicaID), instanceID).
+		WithCommand(command, cmdID).
+		WithPhase("preaccept").
+		WithTags("phase_start", "consensus").
+		Send()
 }
 
-// LogPreAcceptResponse logs a response to a PreAccept request
 func LogPreAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID,
-	initialSeq, newSeq int, initialDeps, newDeps []int, success bool) {
+	initialSeq, newSeq int, initialDeps, newDeps []Dependency, success bool, attributesUnchanged bool) {
 	if GetLogger() == nil {
 		return
 	}
 
-	if success {
-		if initialSeq != newSeq || !equalIntSlice(initialDeps, newDeps) {
-			GetLogger().Info(PREACCEPT, "PreAccept for instance R%d.%d from R%d: CONFLICT | Seq: %d -> %d | Deps: %s -> %s",
-				replicaID, instanceID, fromReplica, initialSeq, newSeq, formatDeps(initialDeps), formatDeps(newDeps))
-		} else {
-			GetLogger().Debug(PREACCEPT, "PreAccept for instance R%d.%d from R%d: OK | Seq: %d | Deps: %s",
-				replicaID, instanceID, fromReplica, newSeq, formatDeps(newDeps))
-		}
-	} else {
-		GetLogger().Warn(PREACCEPT, "PreAccept for instance R%d.%d from R%d: FAILED",
-			replicaID, instanceID, fromReplica)
+	msg := "PreAccept response received"
+	if !success {
+		msg = "PreAccept response failed"
 	}
+
+	logger := GetLogger().Log(INFO, PREACCEPT, msg).
+		WithInstance(int(replicaID), instanceID).
+		WithSequenceChange(initialSeq, newSeq).
+		WithDependencyChange(initialDeps, newDeps).
+		WithContext("from_replica", int(fromReplica)).
+		WithContext("success", success).
+		WithAttributesUnchanged(attributesUnchanged).
+		WithPhase("preaccept").
+		WithTags("response", "consensus")
+
+	if initialSeq != newSeq || !equalDependencySlice(initialDeps, newDeps) {
+		logger.WithTags("conflict_detected")
+	}
+
+	logger.Send()
 }
 
-// LogAcceptPhase logs the beginning of an Accept phase
-func LogAcceptPhase(replicaID ReplicaID, instanceID int, seq int, deps []int, ballot int) {
+func LogAcceptPhase(replicaID ReplicaID, instanceID int, seq int, deps []Dependency, ballot Ballot) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(ACCEPT, "Starting Accept phase for instance R%d.%d | Seq: %d | Deps: %s | Ballot: %d",
-		replicaID, instanceID, seq, formatDeps(deps), ballot)
+	GetLogger().Log(INFO, ACCEPT, "Starting Accept phase").
+		WithInstance(int(replicaID), instanceID).
+		WithSequence(seq).
+		WithDependencies(deps).
+		WithBallot(ballot).
+		WithPhase("accept").
+		WithTags("phase_start", "consensus").
+		Send()
 }
 
-// LogAcceptResponse logs a response to an Accept request
-func LogAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID, ballot int, success bool) {
+func LogAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID, ballot Ballot, success bool) {
 	if GetLogger() == nil {
 		return
 	}
 
-	if success {
-		GetLogger().Debug(ACCEPT, "Accept for instance R%d.%d from R%d: OK | Ballot: %d",
-			replicaID, instanceID, fromReplica, ballot)
-	} else {
-		GetLogger().Warn(ACCEPT, "Accept for instance R%d.%d from R%d: FAILED | Ballot: %d",
-			replicaID, instanceID, fromReplica, ballot)
+	msg := "Accept response received"
+	if !success {
+		msg = "Accept response failed"
 	}
+
+	GetLogger().Log(INFO, ACCEPT, msg).
+		WithInstance(int(replicaID), instanceID).
+		WithBallot(ballot).
+		WithContext("from_replica", int(fromReplica)).
+		WithContext("success", success).
+		WithPhase("accept").
+		WithTags("response", "consensus").
+		Send()
 }
 
-// LogCommitPhase logs the beginning of a Commit phase
-func LogCommitPhase(replicaID ReplicaID, instanceID int, seq int, deps []int) {
+func LogCommitPhase(replicaID ReplicaID, instanceID int, seq int, deps []Dependency) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(COMMIT, "Starting Commit phase for instance R%d.%d | Seq: %d | Deps: %s",
-		replicaID, instanceID, seq, formatDeps(deps))
+	GetLogger().Log(INFO, COMMIT, "Starting Commit phase").
+		WithInstance(int(replicaID), instanceID).
+		WithSequence(seq).
+		WithDependencies(deps).
+		WithPhase("commit").
+		WithTags("phase_start", "consensus").
+		Send()
 }
 
-// LogCommitResponse logs a response to a Commit request
 func LogCommitResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID, success bool) {
 	if GetLogger() == nil {
 		return
 	}
 
-	if success {
-		GetLogger().Debug(COMMIT, "Commit for instance R%d.%d from R%d: OK",
-			replicaID, instanceID, fromReplica)
-	} else {
-		GetLogger().Warn(COMMIT, "Commit for instance R%d.%d from R%d: FAILED",
-			replicaID, instanceID, fromReplica)
+	msg := "Commit response received"
+	if !success {
+		msg = "Commit response failed"
 	}
+
+	GetLogger().Log(INFO, COMMIT, msg).
+		WithInstance(int(replicaID), instanceID).
+		WithContext("from_replica", int(fromReplica)).
+		WithContext("success", success).
+		WithPhase("commit").
+		WithTags("response", "consensus").
+		Send()
 }
 
-// LogExecutionAttempt logs an attempt to execute an instance
+// === Consensus Decision Logging ===
+
+func LogFastPath(replicaID ReplicaID, instanceID int, quorumSize, unchanged int, command Command, cmdID CommandID) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, CONSENSUS, "Fast path consensus achieved").
+		WithInstance(int(replicaID), instanceID).
+		WithQuorum(quorumSize, quorumSize, unchanged).
+		WithFastPath(true).
+		WithCommand(command, cmdID).
+		WithTags("fast_path", "consensus", "optimization").
+		Send()
+}
+
+func LogSlowPath(replicaID ReplicaID, instanceID int, reason string) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, CONSENSUS, "Falling back to slow path").
+		WithInstance(int(replicaID), instanceID).
+		WithFastPath(false).
+		WithContext("reason", reason).
+		WithTags("slow_path", "consensus", "fallback").
+		Send()
+}
+
+func LogAcceptQuorum(replicaID ReplicaID, instanceID int, received, required int) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, CONSENSUS, "Accept quorum achieved").
+		WithInstance(int(replicaID), instanceID).
+		WithQuorum(required, received, 0).
+		WithPhase("accept").
+		WithTags("quorum", "consensus", "success").
+		Send()
+}
+
+func LogAcceptQuorumFailure(replicaID ReplicaID, instanceID int, received, required int) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(WARN, CONSENSUS, "Accept quorum failed").
+		WithInstance(int(replicaID), instanceID).
+		WithQuorum(required, received, 0).
+		WithPhase("accept").
+		WithTags("quorum", "consensus", "failure").
+		Send()
+}
+
+// === Instance State Logging ===
+
+func LogInstanceStateChange(replicaID ReplicaID, instanceID int, oldState, newState InstanceStatus, instance *EPaxosInstance) {
+	if GetLogger() == nil {
+		return
+	}
+
+	logger := GetLogger().Log(INFO, CONSENSUS, "Instance state changed").
+		WithInstance(int(replicaID), instanceID).
+		WithStateChange(oldState, newState)
+
+	if instance != nil {
+		if instance.Command != (Command{}) && instance.CommandID != (CommandID{}) {
+			logger.WithCommand(instance.Command, instance.CommandID)
+		}
+		logger.WithSequence(instance.Seq).
+			WithDependencies(instance.Deps).
+			WithBallot(instance.Ballot).
+			WithContext("committed", instance.Committed).
+			WithContext("executed", instance.Executed)
+	}
+
+	logger.WithTags("state_change", "consensus").Send()
+}
+
+// === Execution Logging ===
+
 func LogExecutionAttempt(replicaID ReplicaID, instanceID int, instance *EPaxosInstance) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Debug(EXECUTION, "Attempting execution for instance R%d.%d | %s",
-		replicaID, instanceID, formatInstance(instance))
+	logger := GetLogger().Log(DEBUG, EXECUTION, "Attempting instance execution").
+		WithInstance(int(replicaID), instanceID)
+
+	if instance != nil {
+		if instance.Command != (Command{}) && instance.CommandID != (CommandID{}) {
+			logger.WithCommand(instance.Command, instance.CommandID)
+		}
+		logger.WithSequence(instance.Seq).
+			WithDependencies(instance.Deps).
+			WithContext("committed", instance.Committed).
+			WithContext("executed", instance.Executed)
+	}
+
+	logger.WithTags("execution", "attempt").Send()
 }
 
-// LogExecutionSuccess logs successful execution of an instance
-func LogExecutionSuccess(replicaID ReplicaID, instanceID int, command Command, result string) {
+func LogExecutionSuccess(replicaID ReplicaID, instanceID int, command Command, result string, duration time.Duration) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(EXECUTION, "Successfully executed instance R%d.%d | Command: %s | Result: %s",
-		replicaID, instanceID, formatCommand(command), result)
+	GetLogger().Log(INFO, EXECUTION, "Instance executed successfully").
+		WithInstance(int(replicaID), instanceID).
+		WithCommand(command, CommandID{}).
+		WithContext("result", result).
+		WithDuration(duration).
+		WithTags("execution", "success").
+		Send()
 }
 
-// LogExecutionFailure logs failed execution of an instance
 func LogExecutionFailure(replicaID ReplicaID, instanceID int, command Command, err error) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Error(EXECUTION, "Failed to execute instance R%d.%d | Command: %s | Error: %v",
-		replicaID, instanceID, formatCommand(command), err)
+	GetLogger().Log(ERROR, EXECUTION, "Instance execution failed").
+		WithInstance(int(replicaID), instanceID).
+		WithCommand(command, CommandID{}).
+		WithError(err, "execution_error").
+		WithTags("execution", "failure").
+		Send()
 }
 
-// LogConflictDetection logs conflict detection between commands
+func LogExecutionOrder(replicaID ReplicaID, instanceID int, order int, sccSize int, graphSize int) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(DEBUG, EXECUTION, "Instance execution order determined").
+		WithInstance(int(replicaID), instanceID).
+		WithExecution(order, sccSize, graphSize).
+		WithTags("execution", "ordering").
+		Send()
+}
+
+// === Dependency and Conflict Logging ===
+
 func LogConflictDetection(replicaID ReplicaID, instanceID int, otherReplicaID int, otherInstanceID int,
 	command Command, otherCommand Command) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Debug(DEPENDENCY, "Conflict detected for instance R%d.%d with R%d.%d | Command: %s conflicts with %s",
-		replicaID, instanceID, otherReplicaID, otherInstanceID,
-		formatCommand(command), formatCommand(otherCommand))
+	GetLogger().Log(DEBUG, DEPENDENCY, "Command conflict detected").
+		WithInstance(int(replicaID), instanceID).
+		WithCommand(command, CommandID{}).
+		WithContext("conflicting_instance", fmt.Sprintf("R%d.%d", otherReplicaID, otherInstanceID)).
+		WithContext("conflicting_command", formatCommand(otherCommand)).
+		WithTags("conflict", "dependency").
+		Send()
 }
 
-// LogDependencyAdded logs when a dependency is added
-func LogDependencyAdded(replicaID ReplicaID, instanceID int, depInstanceID int) {
+func LogDependencyAdded(replicaID ReplicaID, instanceID int, depReplicaID int, depInstanceID int) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Debug(DEPENDENCY, "Added dependency for instance R%d.%d -> %d",
-		replicaID, instanceID, depInstanceID)
+	GetLogger().Log(DEBUG, DEPENDENCY, "Dependency added").
+		WithInstance(int(replicaID), instanceID).
+		WithContext("dependency", fmt.Sprintf("R%d.%d", depReplicaID, depInstanceID)).
+		WithTags("dependency", "added").
+		Send()
 }
 
-// LogReplicaStart logs when a replica starts
-func LogReplicaStart(replicaID ReplicaID, address string, peers []string) {
+func LogDependencyGraphBuilt(replicaID ReplicaID, instanceID int, nodeCount int, edgeCount int, sccCount int) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(REPLICA, "Replica R%d started at %s with peers: %v",
-		replicaID, address, peers)
+	GetLogger().Log(DEBUG, EXECUTION, "Dependency graph constructed").
+		WithInstance(int(replicaID), instanceID).
+		WithContext("node_count", nodeCount).
+		WithContext("edge_count", edgeCount).
+		WithContext("scc_count", sccCount).
+		WithTags("dependency", "graph", "execution").
+		Send()
 }
 
-// LogClientRequest logs a client request
-func LogClientRequest(replicaID ReplicaID, command Command, cmdID CommandID) {
+func LogMissingDependencies(replicaID ReplicaID, instanceID int, missingDeps []string) {
 	if GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Info(CLIENT, "Received client request on R%d | Command: %s | ID: %s",
-		replicaID, formatCommand(command), formatCommandID(cmdID))
+	GetLogger().Log(WARN, EXECUTION, "Missing dependencies detected").
+		WithInstance(int(replicaID), instanceID).
+		WithContext("missing_dependencies", missingDeps).
+		WithTags("dependency", "missing", "recovery_needed").
+		Send()
 }
 
-// LogRPCCall logs an outgoing RPC call
-func LogRPCCall(replicaID ReplicaID, target string, method string, args interface{}) {
+// === Network and RPC Logging ===
+
+func LogRPCCall(replicaID ReplicaID, target string, method string, args interface{}, startTime time.Time) {
 	if GetLogger() == nil {
 		return
 	}
 
-	argsJSON, _ := json.Marshal(args)
-	GetLogger().Debug(RPC, "R%d sending RPC to %s | Method: %s | Args: %s",
-		replicaID, target, method, string(argsJSON))
+	GetLogger().Log(DEBUG, RPC, "Sending RPC request").
+		WithRPC(target, method, 0, true).
+		WithTimeRange(startTime, time.Time{}).
+		WithContext("args", args).
+		WithTags("rpc", "outgoing").
+		Send()
 }
 
-// LogRPCReceive logs an incoming RPC call
 func LogRPCReceive(replicaID ReplicaID, method string, args interface{}) {
 	if GetLogger() == nil {
 		return
 	}
 
-	argsJSON, _ := json.Marshal(args)
-	GetLogger().Debug(RPC, "R%d received RPC | Method: %s | Args: %s",
-		replicaID, method, string(argsJSON))
+	GetLogger().Log(DEBUG, RPC, "Received RPC request").
+		WithRPC("", method, 0, true).
+		WithContext("args", args).
+		WithTags("rpc", "incoming").
+		Send()
 }
 
-// LogKVStoreOperation logs a key-value store operation
-func LogKVStoreOperation(replicaID ReplicaID, operation string, key string, value string, success bool, err error) {
+func LogRPCComplete(replicaID ReplicaID, target string, method string, duration time.Duration, success bool, err error) {
 	if GetLogger() == nil {
 		return
 	}
 
-	if success {
-		GetLogger().Debug(STORAGE, "R%d KV operation: %s | Key: %s | Value: %s | Success: true",
-			replicaID, operation, key, value)
-	} else {
-		GetLogger().Warn(STORAGE, "R%d KV operation: %s | Key: %s | Value: %s | Success: false | Error: %v",
-			replicaID, operation, key, value, err)
+	msg := "RPC completed successfully"
+	level := DEBUG
+	if !success {
+		msg = "RPC failed"
+		level = WARN
 	}
+
+	logger := GetLogger().Log(level, RPC, msg).
+		WithRPC(target, method, duration, success).
+		WithDuration(duration)
+
+	if err != nil {
+		logger.WithError(err, "rpc_error")
+	}
+
+	logger.WithTags("rpc", "completed").Send()
 }
 
-// Helper function for backward compatibility
-func equalIntSlice(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
+func LogNetworkPartition(replicaID ReplicaID, unreachablePeers []string) {
+	if GetLogger() == nil {
+		return
 	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
+
+	GetLogger().Log(ERROR, NETWORK, "Network partition detected").
+		WithContext("unreachable_peers", unreachablePeers).
+		WithContext("peer_count", len(unreachablePeers)).
+		WithTags("network", "partition", "failure").
+		Send()
+}
+
+// === Recovery Logging ===
+
+func LogRecoveryStart(replicaID ReplicaID, targetReplicaID int, instanceID int, reason string, attempt int) {
+	if GetLogger() == nil {
+		return
 	}
-	return true
+
+	GetLogger().Log(INFO, RECOVERY, "Starting instance recovery").
+		WithInstance(targetReplicaID, instanceID).
+		WithRecovery(reason, attempt).
+		WithTags("recovery", "start").
+		Send()
+}
+
+func LogRecoveryComplete(replicaID ReplicaID, targetReplicaID int, instanceID int, success bool, duration time.Duration) {
+	if GetLogger() == nil {
+		return
+	}
+
+	msg := "Instance recovery completed successfully"
+	level := INFO
+	if !success {
+		msg = "Instance recovery failed"
+		level = WARN
+	}
+
+	GetLogger().Log(level, RECOVERY, msg).
+		WithInstance(targetReplicaID, instanceID).
+		WithDuration(duration).
+		WithContext("success", success).
+		WithTags("recovery", "completed").
+		Send()
+}
+
+func LogPreparePhase(replicaID ReplicaID, targetReplicaID int, instanceID int, ballot Ballot) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, RECOVERY, "Starting Prepare phase for recovery").
+		WithInstance(targetReplicaID, instanceID).
+		WithBallot(ballot).
+		WithPhase("prepare").
+		WithTags("recovery", "prepare").
+		Send()
+}
+
+func LogPrepareResponse(replicaID ReplicaID, targetReplicaID int, instanceID int, fromReplica int, success bool, committed bool, instance *EPaxosInstance) {
+	if GetLogger() == nil {
+		return
+	}
+
+	msg := "Prepare response received"
+	if !success {
+		msg = "Prepare response failed"
+	}
+
+	logger := GetLogger().Log(DEBUG, RECOVERY, msg).
+		WithInstance(targetReplicaID, instanceID).
+		WithContext("from_replica", fromReplica).
+		WithContext("success", success).
+		WithContext("committed", committed).
+		WithPhase("prepare")
+
+	if instance != nil {
+		logger.WithCommand(instance.Command, instance.CommandID).
+			WithSequence(instance.Seq).
+			WithDependencies(instance.Deps).
+			WithBallot(instance.Ballot)
+	}
+
+	logger.WithTags("recovery", "prepare", "response").Send()
+}
+
+// === Client and Replica Lifecycle Logging ===
+
+func LogReplicaStart(replicaID ReplicaID, address string, peers []string) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, REPLICA, "Replica started").
+		WithContext("address", address).
+		WithContext("peers", peers).
+		WithContext("peer_count", len(peers)).
+		WithTags("replica", "startup", "lifecycle").
+		Send()
+}
+
+func LogReplicaShutdown(replicaID ReplicaID, reason string) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, REPLICA, "Replica shutting down").
+		WithContext("reason", reason).
+		WithTags("replica", "shutdown", "lifecycle").
+		Send()
+}
+
+func LogClientRequest(replicaID ReplicaID, command Command, cmdID CommandID, commandCount int) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, CLIENT, "Client request received").
+		WithCommand(command, cmdID).
+		WithClient(cmdID.ClientID).
+		WithContext("command_count", commandCount).
+		WithTags("client", "request").
+		Send()
+}
+
+func LogClientResponse(replicaID ReplicaID, command Command, cmdID CommandID, success bool, result string, duration time.Duration, err error) {
+	if GetLogger() == nil {
+		return
+	}
+
+	msg := "Client request completed"
+	level := INFO
+	if !success {
+		msg = "Client request failed"
+		level = WARN
+	}
+
+	logger := GetLogger().Log(level, CLIENT, msg).
+		WithCommand(command, cmdID).
+		WithClient(cmdID.ClientID).
+		WithDuration(duration).
+		WithContext("success", success).
+		WithContext("result", result)
+
+	if err != nil {
+		logger.WithError(err, "client_error")
+	}
+
+	logger.WithTags("client", "response").Send()
+}
+
+// === Storage Logging ===
+
+func LogKVStoreOperation(replicaID ReplicaID, operation string, key string, value string, success bool, err error, duration time.Duration) {
+	if GetLogger() == nil {
+		return
+	}
+
+	msg := fmt.Sprintf("KV %s operation", operation)
+	level := DEBUG
+	if !success {
+		level = WARN
+	}
+
+	logger := GetLogger().Log(level, STORAGE, msg).
+		WithKV(operation, key, value).
+		WithDuration(duration).
+		WithContext("success", success)
+
+	if err != nil {
+		logger.WithError(err, "storage_error")
+	}
+
+	logger.WithTags("storage", "kv", operation).Send()
+}
+
+func LogKVStoreStats(replicaID ReplicaID, totalKeys int, totalOperations int64, avgLatency time.Duration) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, STORAGE, "KV store statistics").
+		WithContext("total_keys", totalKeys).
+		WithContext("total_operations", totalOperations).
+		WithContext("avg_latency_ms", avgLatency.Milliseconds()).
+		WithTags("storage", "statistics").
+		Send()
+}
+
+// === Performance and Metrics Logging ===
+
+func LogPerformanceMetrics(replicaID ReplicaID, metrics map[string]interface{}) {
+	if GetLogger() == nil {
+		return
+	}
+
+	logger := GetLogger().Log(INFO, GENERAL, "Performance metrics")
+	for key, value := range metrics {
+		logger.WithContext(key, value)
+	}
+	logger.WithTags("performance", "metrics").Send()
+}
+
+func LogThroughputMetrics(replicaID ReplicaID, commandsPerSecond float64, period time.Duration) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, GENERAL, "Throughput metrics").
+		WithContext("commands_per_second", commandsPerSecond).
+		WithContext("measurement_period_sec", period.Seconds()).
+		WithTags("performance", "throughput").
+		Send()
+}
+
+func LogLatencyMetrics(replicaID ReplicaID, avgLatency, p50, p95, p99 time.Duration) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(INFO, GENERAL, "Latency metrics").
+		WithContext("avg_latency_ms", avgLatency.Milliseconds()).
+		WithContext("p50_latency_ms", p50.Milliseconds()).
+		WithContext("p95_latency_ms", p95.Milliseconds()).
+		WithContext("p99_latency_ms", p99.Milliseconds()).
+		WithTags("performance", "latency").
+		Send()
+}
+
+// === Error and Alert Logging ===
+
+func LogCriticalError(replicaID ReplicaID, component string, err error, context map[string]interface{}) {
+	if GetLogger() == nil {
+		return
+	}
+
+	logger := GetLogger().Log(ERROR, GENERAL, "Critical error occurred").
+		WithError(err, "critical_error").
+		WithContext("component", component)
+
+	for key, value := range context {
+		logger.WithContext(key, value)
+	}
+
+	logger.WithTags("error", "critical", component).Send()
+}
+
+func LogConsensusTimeout(replicaID ReplicaID, instanceID int, phase string, timeout time.Duration) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(WARN, CONSENSUS, "Consensus phase timeout").
+		WithInstance(int(replicaID), instanceID).
+		WithPhase(phase).
+		WithContext("timeout_duration_ms", timeout.Milliseconds()).
+		WithTags("timeout", "consensus", phase).
+		Send()
+}
+
+func LogQuorumFailure(replicaID ReplicaID, instanceID int, phase string, received int, required int) {
+	if GetLogger() == nil {
+		return
+	}
+
+	GetLogger().Log(WARN, CONSENSUS, "Quorum failure").
+		WithInstance(int(replicaID), instanceID).
+		WithPhase(phase).
+		WithQuorum(required, received, 0).
+		WithTags("quorum", "failure", phase).
+		Send()
+}
+
+// === Debugging and Development Logging ===
+
+func LogDebugState(replicaID ReplicaID, component string, state map[string]interface{}) {
+	if GetLogger() == nil {
+		return
+	}
+
+	logger := GetLogger().Log(DEBUG, GENERAL, "Debug state dump").
+		WithContext("component", component)
+
+	for key, value := range state {
+		logger.WithContext(key, value)
+	}
+
+	logger.WithTags("debug", "state", component).Send()
+}
+
+func LogInstanceDump(replicaID ReplicaID, instanceID int, instance *EPaxosInstance) {
+	if GetLogger() == nil {
+		return
+	}
+
+	logger := GetLogger().Log(DEBUG, GENERAL, "Instance state dump").
+		WithInstance(int(replicaID), instanceID)
+
+	if instance != nil {
+		logger.WithCommand(instance.Command, instance.CommandID).
+			WithSequence(instance.Seq).
+			WithDependencies(instance.Deps).
+			WithBallot(instance.Ballot).
+			WithStatus(instance.Status).
+			WithContext("committed", instance.Committed).
+			WithContext("executed", instance.Executed).
+			WithContext("timestamp", instance.Timestamp).
+			WithContext("leader", instance.Leader).
+			WithAttributesUnchanged(instance.AttributesUnchanged)
+	}
+
+	logger.WithTags("debug", "instance", "dump").Send()
 }

@@ -77,6 +77,7 @@ type PrepareReply struct {
 // === ReplicaRPC Additions ===
 
 func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error {
+
 	LogPreAcceptPhase(args.ReplicaID, args.InstanceID, args.Command, args.CommandID)
 
 	r.Replica.InstanceLock.Lock()
@@ -114,7 +115,7 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 				}
 
 				// Add dependency on conflicting instance from ANY replica
-				LogDependencyAdded(args.ReplicaID, args.InstanceID, iid)
+				LogDependencyAdded(args.ReplicaID, args.InstanceID, rid, iid)
 				newDeps = appendDependencyIfMissing(newDeps, rid, iid)
 			}
 		}
@@ -131,7 +132,7 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 		Deps:                newDeps,
 		Status:              StatusPreAccepted,
 		Ballot:              args.Ballot,
-		AttributesUnchanged: attributesUnchanged, // NEW: Mark if unchanged
+		AttributesUnchanged: attributesUnchanged,
 	}
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 
@@ -142,13 +143,15 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 	reply.Ballot = args.Ballot
 	reply.AttributesUnchanged = attributesUnchanged // NEW: Include in reply
 
-	LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Seq, maxSeq, convertDepsToIntSlice(args.Deps), convertDepsToIntSlice(newDeps), reply.OK)
+	//LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID,
+	//	args.Seq, maxSeq, args.Deps, newDeps, true, attributesUnchanged)
 
 	return nil
 }
 
 func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
-	LogAcceptPhase(args.ReplicaID, args.InstanceID, args.Seq, convertDepsToIntSlice(args.Deps), args.Ballot.Sequence)
+
+	LogAcceptPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps, args.Ballot)
 
 	r.Replica.InstanceLock.Lock()
 	defer r.Replica.InstanceLock.Unlock()
@@ -157,7 +160,7 @@ func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
 		r.Replica.Instances[int(args.ReplicaID)] = make(map[int]*EPaxosInstance)
 	}
 
-	// Check ballot number
+	// Check ballot number with detailed logging
 	if existingInst, exists := r.Replica.Instances[int(args.ReplicaID)][args.InstanceID]; exists {
 		if CompareBallots(args.Ballot, existingInst.Ballot) < 0 {
 			reply.OK = false
@@ -180,13 +183,13 @@ func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
 	reply.OK = true
 	reply.Ballot = args.Ballot
 
-	LogAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Ballot.Sequence, reply.OK)
-
+	//LogAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, args.Ballot, true)
 	return nil
 }
 
 func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
-	LogCommitPhase(args.ReplicaID, args.InstanceID, args.Seq, convertDepsToIntSlice(args.Deps))
+
+	LogCommitPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps)
 
 	r.Replica.InstanceLock.Lock()
 	if _, ok := r.Replica.Instances[int(args.ReplicaID)]; !ok {
@@ -205,7 +208,7 @@ func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 	r.Replica.InstanceLock.Unlock()
 
-	LogCommitResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, true)
+	//LogCommitResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, true)
 
 	// Try to execute right after committing
 	go r.Replica.TryExecute(int(args.ReplicaID), args.InstanceID)
@@ -245,13 +248,16 @@ func (r *ReplicaRPC) Prepare(args PrepareArgs, reply *PrepareReply) error {
 	reply.Instance = inst
 	reply.Committed = inst.Status == StatusCommitted
 
+	//LogPrepareResponse(ReplicaID(r.Replica.ID), int(args.ReplicaID), args.InstanceID,
+	//	int(r.Replica.ID), true, reply.Committed, inst)
+
 	return nil
 }
 
 // === RPC Senders with Timeouts ===
 
 func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, error) {
-	LogRPCCall(args.ReplicaID, address, "ReplicaRPC.PreAccept", args)
+	startTime := time.Now()
 
 	// Create a channel to receive the result
 	type rpcResult struct {
@@ -271,21 +277,30 @@ func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, e
 
 		var reply PreAcceptReply
 		err = client.Call("ReplicaRPC.PreAccept", args, &reply)
-		LogRPCReceive(args.ReplicaID, "ReplicaRPC.PreAccept", args)
 		resultChan <- rpcResult{&reply, err}
 	}()
 
 	// Wait for result or timeout
 	select {
 	case result := <-resultChan:
+		duration := time.Since(startTime)
+		success := result.err == nil
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, success, result.err)
+
 		return result.reply, result.err
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("RPC call to %s timed out", address)
+		duration := time.Since(startTime)
+		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, false, timeoutErr)
+
+		return nil, timeoutErr
 	}
 }
 
 func SendAcceptToPeer(address string, args AcceptArgs) (*AcceptReply, error) {
-	LogRPCCall(args.ReplicaID, address, "ReplicaRPC.Accept", args)
+	startTime := time.Now()
 
 	type rpcResult struct {
 		reply *AcceptReply
@@ -304,20 +319,29 @@ func SendAcceptToPeer(address string, args AcceptArgs) (*AcceptReply, error) {
 
 		var reply AcceptReply
 		err = client.Call("ReplicaRPC.Accept", args, &reply)
-		LogRPCReceive(args.ReplicaID, "ReplicaRPC.Accept", args)
 		resultChan <- rpcResult{&reply, err}
 	}()
 
 	select {
 	case result := <-resultChan:
+		duration := time.Since(startTime)
+		success := result.err == nil
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, success, result.err)
+
 		return result.reply, result.err
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("RPC call to %s timed out", address)
+		duration := time.Since(startTime)
+		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, false, timeoutErr)
+
+		return nil, timeoutErr
 	}
 }
 
 func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
-	LogRPCCall(args.ReplicaID, address, "ReplicaRPC.Commit", args)
+	startTime := time.Now()
 
 	type rpcResult struct {
 		reply *CommitReply
@@ -336,19 +360,30 @@ func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
 
 		var reply CommitReply
 		err = client.Call("ReplicaRPC.Commit", args, &reply)
-		LogRPCReceive(args.ReplicaID, "ReplicaRPC.Commit", args)
 		resultChan <- rpcResult{&reply, err}
 	}()
 
 	select {
 	case result := <-resultChan:
+		duration := time.Since(startTime)
+		success := result.err == nil
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, success, result.err)
+
 		return result.reply, result.err
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("RPC call to %s timed out", address)
+		duration := time.Since(startTime)
+		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, false, timeoutErr)
+
+		return nil, timeoutErr
 	}
 }
 
 func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) {
+	startTime := time.Now()
+
 	type rpcResult struct {
 		reply *PrepareReply
 		err   error
@@ -371,9 +406,19 @@ func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) 
 
 	select {
 	case result := <-resultChan:
+		duration := time.Since(startTime)
+		success := result.err == nil
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, success, result.err)
+
 		return result.reply, result.err
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("RPC call to %s timed out", address)
+		duration := time.Since(startTime)
+		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+
+		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, false, timeoutErr)
+
+		return nil, timeoutErr
 	}
 }
 
@@ -407,6 +452,8 @@ func (r *Replica) runLocalPreAccept(command Command, cmdID CommandID, seq int, d
 }
 
 func (r *Replica) Propose(command Command, cmdID CommandID) error {
+	startTime := time.Now()
+
 	r.InstanceLock.Lock()
 	instanceID := r.NextInstance
 	r.NextInstance++
@@ -415,6 +462,16 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	// Calculate proper fast-path quorum size: F + ⌈(F+1)/2⌉
 	f := len(r.Peers) / 2         // Number of tolerated failures
 	fastPathQuorum := f + (f+1)/2 // ⌈(F+1)/2⌉ = (F+1+1)/2 for integer division
+
+	// Log the proposal start with comprehensive context
+	GetLogger().Log(INFO, CONSENSUS, "Starting consensus proposal").
+		WithInstance(int(r.ID), instanceID).
+		WithCommand(command, cmdID).
+		WithContext("fast_path_quorum_required", fastPathQuorum).
+		WithContext("total_peers", len(r.Peers)).
+		WithContext("failure_tolerance", f).
+		WithTags("proposal", "start", "consensus").
+		Send()
 
 	// Initial guess
 	initialSeq := 1
@@ -468,19 +525,50 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	}
 	r.InstanceLock.Unlock()
 
+	// Enhanced logging for PreAccept phase
+	GetLogger().Log(INFO, PREACCEPT, "Broadcasting PreAccept to peers").
+		WithInstance(int(r.ID), instanceID).
+		WithCommand(command, cmdID).
+		WithSequence(localSeq).
+		WithDependencies(localDeps).
+		WithBallot(ballot).
+		WithContext("peer_count", len(r.Peers)).
+		WithTags("preaccept", "broadcast").
+		Send()
+
 	// Send PreAccept to ALL peers (redundant PreAccepts)
-	for _, peer := range r.Peers {
+	for i, peer := range r.Peers {
+		peerStartTime := time.Now()
 		reply, err := SendPreAcceptToPeer(peer, args)
+		peerDuration := time.Since(peerStartTime)
+
 		if err != nil {
-			GetLogger().Error(PREACCEPT, "PreAccept to %s failed: %v", peer, err)
+			GetLogger().Log(ERROR, PREACCEPT, "PreAccept RPC failed").
+				WithInstance(int(r.ID), instanceID).
+				WithRPC(peer, "ReplicaRPC.PreAccept", peerDuration, false).
+				WithError(err, "rpc_error").
+				WithContext("peer_index", i).
+				WithTags("preaccept", "rpc", "failure").
+				Send()
 			continue
 		}
+
 		if reply.OK {
 			okCount++
 			replies = append(replies, *reply)
 			if reply.AttributesUnchanged {
 				unchangedCount++
 			}
+
+			// Log successful PreAccept response with detailed analysis
+			//LogPreAcceptResponse(r.ID, instanceID, ReplicaID(i),
+			//	localSeq, reply.Seq, localDeps, reply.Deps,
+			//	true, reply.AttributesUnchanged)
+
+		} else {
+			LogPreAcceptResponse(r.ID, instanceID, ReplicaID(i),
+				localSeq, 0, localDeps, []Dependency{},
+				false, false)
 		}
 	}
 
@@ -494,13 +582,12 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 	}
 
-	// NEW: Enhanced fast path condition for redundant PreAccepts
-	// We need F + ⌈(F+1)/2⌉ - 1 replies that match AND are unchanged
+	// Enhanced fast path condition for redundant PreAccepts
 	canUseFastPath := same && unchangedCount >= fastPathQuorum
 
 	if canUseFastPath {
-		GetLogger().Info(CONSENSUS, "Fast path with redundant PreAccepts: %d unchanged replies out of %d total (need %d)", unchangedCount, okCount, fastPathQuorum-1)
-		LogFastPath()
+		// Enhanced fast path logging
+
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
 			InstanceID: instanceID,
@@ -524,12 +611,16 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			inst.Committed = true
 		}
 		r.InstanceLock.Unlock()
+
+		LogFastPath(r.ID, instanceID, fastPathQuorum, unchangedCount, command, cmdID)
+
 		return nil
 	}
 
-	// Slow path: send Accept
-	GetLogger().Info(CONSENSUS, "Slow path: only %d unchanged replies, need %d", unchangedCount, fastPathQuorum-1)
-	LogSlowPath()
+	// Slow path with enhanced logging
+	reason := fmt.Sprintf("unchanged_responses=%d, required=%d, identical=%v",
+		unchangedCount-1, fastPathQuorum-1, same)
+
 	maxSeq := getMaxSeq(replies)
 	allDeps := mergeDependencies(replies)
 
@@ -548,19 +639,38 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	ackCount := 1          // self
 	classicQuorum := f + 1 // Classic Paxos quorum
 
-	for _, peer := range r.Peers {
+	acceptStart := time.Now()
+	LogAcceptPhase(r.ID, instanceID, maxSeq, allDeps, ballot)
+
+	for i, peer := range r.Peers {
+		peerStartTime := time.Now()
 		reply, err := SendAcceptToPeer(peer, acceptArgs)
+		peerDuration := time.Since(peerStartTime)
+
 		if err != nil {
-			GetLogger().Error(ACCEPT, "Accept to %s failed: %v", peer, err)
+			GetLogger().Log(ERROR, ACCEPT, "Accept RPC failed").
+				WithInstance(int(r.ID), instanceID).
+				WithRPC(peer, "ReplicaRPC.Accept", peerDuration, false).
+				WithError(err, "rpc_error").
+				WithContext("peer_index", i).
+				WithTags("accept", "rpc", "failure").
+				Send()
 			continue
 		}
+
 		if reply.OK {
 			ackCount++
+			LogAcceptResponse(r.ID, instanceID, ReplicaID(i), reply.Ballot, true)
+		} else {
+			LogAcceptResponse(r.ID, instanceID, ReplicaID(i), reply.Ballot, false)
 		}
 	}
 
+	acceptDuration := time.Since(acceptStart)
+
 	if ackCount >= classicQuorum {
-		LogAcceptQuorum()
+		LogAcceptQuorum(r.ID, instanceID, ackCount, classicQuorum)
+
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
 			InstanceID: instanceID,
@@ -585,9 +695,32 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			inst.Ballot = ballot
 		}
 		r.InstanceLock.Unlock()
+
+		totalDuration := time.Since(startTime)
+		GetLogger().Log(INFO, CONSENSUS, "Slow path consensus completed").
+			WithInstance(int(r.ID), instanceID).
+			WithCommand(command, cmdID).
+			WithDuration(totalDuration).
+			WithContext("accept_phase_duration_ms", acceptDuration.Milliseconds()).
+			WithTags("slow_path", "completed", "success").
+			Send()
+
 	} else {
-		LogAcceptQuorumFailure()
+		//LogAcceptQuorumFailure(r.ID, instanceID, ackCount, classicQuorum)
+
+		totalDuration := time.Since(startTime)
+		GetLogger().Log(ERROR, CONSENSUS, "Consensus failed - insufficient Accept responses").
+			WithInstance(int(r.ID), instanceID).
+			WithCommand(command, cmdID).
+			WithQuorum(classicQuorum, ackCount, 0).
+			WithDuration(totalDuration).
+			WithContext("accept_phase_duration_ms", acceptDuration.Milliseconds()).
+			WithError(fmt.Errorf("insufficient accept responses: %d/%d", ackCount, classicQuorum), "consensus_failure").
+			WithTags("slow_path", "failed", "quorum_failure").
+			Send()
 	}
+
+	LogSlowPath(r.ID, instanceID, reason)
 
 	return nil
 }
@@ -621,6 +754,10 @@ func allUnchangedInstancesMatch(unchangedReplies []*PrepareReply) bool {
 
 // ExplicitPrepare implements the recovery protocol from Figure 3 with redundant PreAccepts support
 func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
+	recoveryStart := time.Now()
+
+	LogRecoveryStart(r.ID, replicaID, instanceID, "explicit_prepare", 1)
+
 	r.InstanceLock.Lock()
 	ballot := Ballot{
 		Epoch:     0,
@@ -643,7 +780,12 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 	for _, peer := range allPeers {
 		reply, err := SendPrepareToPeer(peer, args)
 		if err != nil {
-			GetLogger().Error(CONSENSUS, "Prepare to %s failed: %v", peer, err)
+			GetLogger().Log(ERROR, RECOVERY, "Prepare RPC failed").
+				WithInstance(replicaID, instanceID).
+				WithRPC(peer, "ReplicaRPC.Prepare", 0, false).
+				WithError(err, "rpc_error").
+				WithTags("recovery", "prepare", "rpc_failure").
+				Send()
 			continue
 		}
 		if reply.OK {
@@ -654,9 +796,21 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 
 	f := len(r.Peers) / 2
 	if okCount < f+1 {
-		GetLogger().Warn(CONSENSUS, "Recovery failed: insufficient Prepare replies (%d, need %d)", okCount, f+1)
+		GetLogger().Log(WARN, RECOVERY, "Recovery failed - insufficient Prepare replies").
+			WithInstance(replicaID, instanceID).
+			WithQuorum(f+1, okCount, 0).
+			WithDuration(time.Since(recoveryStart)).
+			WithTags("recovery", "failed", "insufficient_quorum").
+			Send()
 		return nil // Cannot proceed without majority
 	}
+
+	GetLogger().Log(DEBUG, RECOVERY, "Prepare quorum achieved").
+		WithInstance(replicaID, instanceID).
+		WithQuorum(f+1, okCount, 0).
+		WithContext("total_replies", len(replies)).
+		WithTags("recovery", "prepare", "quorum").
+		Send()
 
 	// Find the highest ballot among replies
 	var highestInstance *EPaxosInstance
@@ -677,7 +831,14 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 
 	if committed && highestInstance != nil {
 		// Instance is already committed, just commit locally
-		GetLogger().Info(CONSENSUS, "Recovery: Instance R%d.%d already committed", replicaID, instanceID)
+		GetLogger().Log(INFO, RECOVERY, "Instance already committed during recovery").
+			WithInstance(replicaID, instanceID).
+			WithCommand(highestInstance.Command, highestInstance.CommandID).
+			WithSequence(highestInstance.Seq).
+			WithDependencies(highestInstance.Deps).
+			WithTags("recovery", "already_committed").
+			Send()
+
 		commitArgs := CommitArgs{
 			ReplicaID:  ReplicaID(replicaID),
 			InstanceID: instanceID,
@@ -707,21 +868,35 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		for _, peer := range r.Peers {
 			go SendCommitToPeer(peer, commitArgs)
 		}
+
+		LogRecoveryComplete(r.ID, replicaID, instanceID, true, time.Since(recoveryStart))
 		return nil
 	}
 
 	if highestInstance != nil {
-		// NEW: Check if this could have been committed on fast path with redundant PreAccepts
+		// Check if this could have been committed on fast path with redundant PreAccepts
 		unchangedReplies := filterUnchangedInstances(replies)
 		fastPathQuorum := f + (f+1)/2 // F + ⌈(F+1)/2⌉
 
-		GetLogger().Info(CONSENSUS, "Recovery: Found %d unchanged replies out of %d total (need %d for fast-path)",
-			len(unchangedReplies), len(replies), fastPathQuorum-1)
+		GetLogger().Log(INFO, RECOVERY, "Analyzing recovery for fast-path eligibility").
+			WithInstance(replicaID, instanceID).
+			WithContext("unchanged_replies", len(unchangedReplies)).
+			WithContext("total_replies", len(replies)).
+			WithContext("fast_path_quorum_required", fastPathQuorum-1).
+			WithTags("recovery", "fast_path", "analysis").
+			Send()
 
 		// If we have enough unchanged replies with identical attributes,
 		// this instance could have been fast-path committed
 		if len(unchangedReplies) >= fastPathQuorum-1 && allUnchangedInstancesMatch(unchangedReplies) {
-			GetLogger().Info(CONSENSUS, "Recovery: Fast-path committing R%d.%d based on unchanged replies", replicaID, instanceID)
+			GetLogger().Log(INFO, RECOVERY, "Fast-path committing during recovery").
+				WithInstance(replicaID, instanceID).
+				WithCommand(highestInstance.Command, highestInstance.CommandID).
+				WithSequence(highestInstance.Seq).
+				WithDependencies(highestInstance.Deps).
+				WithContext("unchanged_replies", len(unchangedReplies)).
+				WithTags("recovery", "fast_path", "commit").
+				Send()
 
 			// This instance was likely fast-path committed, commit directly
 			commitArgs := CommitArgs{
@@ -754,12 +929,20 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 			for _, peer := range r.Peers {
 				go SendCommitToPeer(peer, commitArgs)
 			}
+
+			LogRecoveryComplete(r.ID, replicaID, instanceID, true, time.Since(recoveryStart))
 			return nil
 		}
 
 		// Fall back to Accept phase for regular recovery
-		GetLogger().Info(CONSENSUS, "Recovery: Using Accept phase for R%d.%d (insufficient unchanged replies: %d, need %d)",
-			replicaID, instanceID, len(unchangedReplies), fastPathQuorum-1)
+		GetLogger().Log(INFO, RECOVERY, "Using Accept phase for recovery").
+			WithInstance(replicaID, instanceID).
+			WithCommand(highestInstance.Command, highestInstance.CommandID).
+			WithContext("unchanged_replies", len(unchangedReplies)).
+			WithContext("required_unchanged", fastPathQuorum-1).
+			WithContext("reason", "insufficient_unchanged_replies").
+			WithTags("recovery", "accept_phase", "fallback").
+			Send()
 
 		acceptArgs := AcceptArgs{
 			ReplicaID:  ReplicaID(replicaID),
@@ -775,7 +958,12 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		for _, peer := range r.Peers {
 			reply, err := SendAcceptToPeer(peer, acceptArgs)
 			if err != nil {
-				GetLogger().Error(CONSENSUS, "Accept to %s failed during recovery: %v", peer, err)
+				GetLogger().Log(ERROR, RECOVERY, "Accept RPC failed during recovery").
+					WithInstance(replicaID, instanceID).
+					WithRPC(peer, "ReplicaRPC.Accept", 0, false).
+					WithError(err, "rpc_error").
+					WithTags("recovery", "accept", "rpc_failure").
+					Send()
 				continue
 			}
 			if reply.OK {
@@ -784,7 +972,6 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		}
 
 		if ackCount >= f+1 {
-			GetLogger().Info(CONSENSUS, "Recovery: Accept quorum achieved for R%d.%d, committing", replicaID, instanceID)
 
 			// Commit the instance
 			commitArgs := CommitArgs{
@@ -817,13 +1004,14 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 			for _, peer := range r.Peers {
 				go SendCommitToPeer(peer, commitArgs)
 			}
+
+			LogRecoveryComplete(r.ID, replicaID, instanceID, true, time.Since(recoveryStart))
+
 		} else {
-			GetLogger().Warn(CONSENSUS, "Recovery: Accept quorum failed for R%d.%d (%d acks, need %d)",
-				replicaID, instanceID, ackCount, f+1)
+			LogRecoveryComplete(r.ID, replicaID, instanceID, false, time.Since(recoveryStart))
 		}
 	} else {
 		// No instance found, commit no-op
-		GetLogger().Info(CONSENSUS, "Recovery: No instance found for R%d.%d, committing no-op", replicaID, instanceID)
 
 		noOpCommand := Command{Type: CmdGet, Key: "__noop__", Value: ""}
 		noOpCmdID := CommandID{ClientID: "system", SeqNum: instanceID}
@@ -858,6 +1046,8 @@ func (r *Replica) ExplicitPrepare(replicaID int, instanceID int) error {
 		for _, peer := range r.Peers {
 			go SendCommitToPeer(peer, commitArgs)
 		}
+
+		LogRecoveryComplete(r.ID, replicaID, instanceID, true, time.Since(recoveryStart))
 	}
 
 	return nil
