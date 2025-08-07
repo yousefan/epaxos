@@ -304,6 +304,9 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 
 // executeCommand executes a single command and marks it as executed
 func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance) bool {
+
+	startTime := time.Now()
+
 	if inst.Executed {
 		return true
 	}
@@ -312,23 +315,25 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	if inst.Command.Key == "__noop__" {
 		inst.Executed = true
 		inst.Status = StatusExecuted
-		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, "noop")
+		totalDuration := time.Since(startTime)
+		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, "noop", totalDuration)
 		return true
 	}
 
 	// Apply the command to the local KV store
-	oldStatus := inst.Status
+	//oldStatus := inst.Status
 	result, err := r.KVStore.ApplyCommand(inst.Command)
 	if err != nil {
-		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, err)
+		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, err)
 		return false
 	}
 
 	inst.Executed = true
 	inst.Status = StatusExecuted
 
-	LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, result)
-	LogInstanceStateChange(ReplicaID(replicaID), instanceID, oldStatus, inst.Status, inst)
+	totalDuration := time.Since(startTime)
+	LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, result, totalDuration)
+	//LogInstanceStateChange(ReplicaID(replicaID), instanceID, oldStatus, inst.Status, inst)
 	return true
 }
 
