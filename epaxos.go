@@ -612,6 +612,14 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 		r.InstanceLock.Unlock()
 
+		executed := r.TryExecute(int(r.ID), instanceID)
+		if !executed {
+			for i := 0; i < 3 && !executed; i++ {
+				time.Sleep(10 * time.Millisecond)
+				executed = r.TryExecute(int(r.ID), instanceID)
+			}
+		}
+
 		LogFastPath(r.ID, instanceID, fastPathQuorum, okCount, unchangedCount, command, cmdID)
 
 		return nil
@@ -718,6 +726,15 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			WithError(fmt.Errorf("insufficient accept responses: %d/%d", ackCount, classicQuorum), "consensus_failure").
 			WithTags("slow_path", "failed", "quorum_failure").
 			Send()
+	}
+
+	executed := r.TryExecute(int(r.ID), instanceID)
+	if !executed {
+		// Brief retry if execution failed due to dependencies
+		for i := 0; i < 3 && !executed; i++ {
+			time.Sleep(10 * time.Millisecond)
+			executed = r.TryExecute(int(r.ID), instanceID)
+		}
 	}
 
 	LogSlowPath(r.ID, instanceID, reason)

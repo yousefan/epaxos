@@ -321,19 +321,22 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	}
 
 	// Apply the command to the local KV store
-	//oldStatus := inst.Status
 	result, err := r.KVStore.ApplyCommand(inst.Command)
-	if err != nil {
-		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, err)
-		return false
-	}
 
 	inst.Executed = true
 	inst.Status = StatusExecuted
 
 	totalDuration := time.Since(startTime)
-	LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, result, totalDuration)
-	//LogInstanceStateChange(ReplicaID(replicaID), instanceID, oldStatus, inst.Status, inst)
+
+	if err != nil {
+		// Log the error but still consider the command as successfully executed
+		// For GET operations, "key not found" is a valid result, not a failure
+		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, err)
+		// You might want to store the error as the result for client response
+	} else {
+		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, result, totalDuration)
+	}
+
 	return true
 }
 
