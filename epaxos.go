@@ -526,15 +526,15 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	r.InstanceLock.Unlock()
 
 	// Enhanced logging for PreAccept phase
-	GetLogger().Log(INFO, PREACCEPT, "Broadcasting PreAccept to peers").
-		WithInstance(int(r.ID), instanceID).
-		WithCommand(command, cmdID).
-		WithSequence(localSeq).
-		WithDependencies(localDeps).
-		WithBallot(ballot).
-		WithContext("peer_count", len(r.Peers)).
-		WithTags("preaccept", "broadcast").
-		Send()
+	//GetLogger().Log(INFO, PREACCEPT, "Broadcasting PreAccept to peers").
+	//	WithInstance(int(r.ID), instanceID).
+	//	WithCommand(command, cmdID).
+	//	WithSequence(localSeq).
+	//	WithDependencies(localDeps).
+	//	WithBallot(ballot).
+	//	WithContext("peer_count", len(r.Peers)).
+	//	WithTags("preaccept", "broadcast").
+	//	Send()
 
 	// Send PreAccept to ALL peers (redundant PreAccepts)
 	for i, peer := range r.Peers {
@@ -714,7 +714,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			Send()
 
 	} else {
-		//LogAcceptQuorumFailure(r.ID, instanceID, ackCount, classicQuorum)
+		LogAcceptQuorumFailure(r.ID, instanceID, ackCount, classicQuorum)
 
 		totalDuration := time.Since(startTime)
 		GetLogger().Log(ERROR, CONSENSUS, "Consensus failed - insufficient Accept responses").

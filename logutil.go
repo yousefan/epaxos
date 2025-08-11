@@ -6,10 +6,111 @@ import (
 	"time"
 )
 
+// LogConfig contains flags to enable/disable individual logging functions
+type LogConfig struct {
+	// Individual function flags
+	EnableLogPreAcceptPhase       bool
+	EnableLogPreAcceptResponse    bool
+	EnableLogAcceptPhase          bool
+	EnableLogAcceptResponse       bool
+	EnableLogCommitPhase          bool
+	EnableLogCommitResponse       bool
+	EnableLogFastPath             bool
+	EnableLogSlowPath             bool
+	EnableLogAcceptQuorum         bool
+	EnableLogAcceptQuorumFailure  bool
+	EnableLogInstanceStateChange  bool
+	EnableLogExecutionAttempt     bool
+	EnableLogExecutionSuccess     bool
+	EnableLogExecutionFailure     bool
+	EnableLogExecutionOrder       bool
+	EnableLogConflictDetection    bool
+	EnableLogDependencyAdded      bool
+	EnableLogDependencyGraphBuilt bool
+	EnableLogMissingDependencies  bool
+	EnableLogRPCCall              bool
+	EnableLogRPCReceive           bool
+	EnableLogRPCComplete          bool
+	EnableLogNetworkPartition     bool
+	EnableLogRecoveryStart        bool
+	EnableLogRecoveryComplete     bool
+	EnableLogPreparePhase         bool
+	EnableLogPrepareResponse      bool
+	EnableLogReplicaStart         bool
+	EnableLogReplicaShutdown      bool
+	EnableLogClientRequest        bool
+	EnableLogClientResponse       bool
+	EnableLogKVStoreOperation     bool
+	EnableLogKVStoreStats         bool
+	EnableLogPerformanceMetrics   bool
+	EnableLogThroughputMetrics    bool
+	EnableLogLatencyMetrics       bool
+	EnableLogCriticalError        bool
+	EnableLogConsensusTimeout     bool
+	EnableLogQuorumFailure        bool
+	EnableLogDebugState           bool
+	EnableLogInstanceDump         bool
+}
+
+// Default log configuration with all logging enabled
+var logConfig = LogConfig{
+	EnableLogPreAcceptPhase:       false,
+	EnableLogPreAcceptResponse:    true,
+	EnableLogAcceptPhase:          false,
+	EnableLogAcceptResponse:       true,
+	EnableLogCommitPhase:          true,
+	EnableLogCommitResponse:       false,
+	EnableLogFastPath:             true,
+	EnableLogSlowPath:             true,
+	EnableLogAcceptQuorum:         false,
+	EnableLogAcceptQuorumFailure:  false,
+	EnableLogInstanceStateChange:  false,
+	EnableLogExecutionAttempt:     false,
+	EnableLogExecutionSuccess:     true,
+	EnableLogExecutionFailure:     true,
+	EnableLogExecutionOrder:       false,
+	EnableLogConflictDetection:    true,
+	EnableLogDependencyAdded:      true,
+	EnableLogDependencyGraphBuilt: false,
+	EnableLogMissingDependencies:  false,
+	EnableLogRPCCall:              false,
+	EnableLogRPCReceive:           false,
+	EnableLogRPCComplete:          false,
+	EnableLogNetworkPartition:     false,
+	EnableLogRecoveryStart:        false,
+	EnableLogRecoveryComplete:     false,
+	EnableLogPreparePhase:         false,
+	EnableLogPrepareResponse:      false,
+	EnableLogReplicaStart:         false,
+	EnableLogReplicaShutdown:      false,
+	EnableLogClientRequest:        true,
+	EnableLogClientResponse:       false,
+	EnableLogKVStoreOperation:     false,
+	EnableLogKVStoreStats:         false,
+	EnableLogPerformanceMetrics:   false,
+	EnableLogThroughputMetrics:    false,
+	EnableLogLatencyMetrics:       false,
+	EnableLogCriticalError:        false,
+	EnableLogConsensusTimeout:     false,
+	EnableLogQuorumFailure:        true,
+	EnableLogDebugState:           false,
+	EnableLogInstanceDump:         false,
+}
+
+// SetLogConfig updates the logging configuration
+func SetLogConfig(config LogConfig) {
+	logConfig = config
+}
+
+// GetLogConfig returns the current logging configuration
+func GetLogConfig() LogConfig {
+	return logConfig
+}
+
 // === EPaxos Phase Logging ===
 
 func LogPreAcceptPhase(replicaID ReplicaID, instanceID int, command Command, cmdID CommandID) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogPreAcceptPhase || GetLogger() == nil {
 		return
 	}
 
@@ -23,7 +124,7 @@ func LogPreAcceptPhase(replicaID ReplicaID, instanceID int, command Command, cmd
 
 func LogPreAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID,
 	initialSeq, newSeq int, initialDeps, newDeps []Dependency, success bool, attributesUnchanged bool) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogPreAcceptResponse || GetLogger() == nil {
 		return
 	}
 
@@ -50,7 +151,7 @@ func LogPreAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica Repli
 }
 
 func LogAcceptPhase(replicaID ReplicaID, instanceID int, seq int, deps []Dependency, ballot Ballot) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogAcceptPhase || GetLogger() == nil {
 		return
 	}
 
@@ -65,7 +166,7 @@ func LogAcceptPhase(replicaID ReplicaID, instanceID int, seq int, deps []Depende
 }
 
 func LogAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID, ballot Ballot, success bool) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogAcceptResponse || GetLogger() == nil {
 		return
 	}
 
@@ -85,7 +186,7 @@ func LogAcceptResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaI
 }
 
 func LogCommitPhase(replicaID ReplicaID, instanceID int, seq int, deps []Dependency) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogCommitPhase || GetLogger() == nil {
 		return
 	}
 
@@ -99,7 +200,7 @@ func LogCommitPhase(replicaID ReplicaID, instanceID int, seq int, deps []Depende
 }
 
 func LogCommitResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaID, success bool) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogCommitResponse || GetLogger() == nil {
 		return
 	}
 
@@ -120,7 +221,7 @@ func LogCommitResponse(replicaID ReplicaID, instanceID int, fromReplica ReplicaI
 // === Consensus Decision Logging ===
 
 func LogFastPath(replicaID ReplicaID, instanceID int, quorumSize, received int, unchanged int, command Command, cmdID CommandID) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogFastPath || GetLogger() == nil {
 		return
 	}
 
@@ -134,7 +235,7 @@ func LogFastPath(replicaID ReplicaID, instanceID int, quorumSize, received int, 
 }
 
 func LogSlowPath(replicaID ReplicaID, instanceID int, reason string) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogSlowPath || GetLogger() == nil {
 		return
 	}
 
@@ -147,7 +248,7 @@ func LogSlowPath(replicaID ReplicaID, instanceID int, reason string) {
 }
 
 func LogAcceptQuorum(replicaID ReplicaID, instanceID int, received, required int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogAcceptQuorum || GetLogger() == nil {
 		return
 	}
 
@@ -160,7 +261,7 @@ func LogAcceptQuorum(replicaID ReplicaID, instanceID int, received, required int
 }
 
 func LogAcceptQuorumFailure(replicaID ReplicaID, instanceID int, received, required int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogAcceptQuorumFailure || GetLogger() == nil {
 		return
 	}
 
@@ -175,7 +276,7 @@ func LogAcceptQuorumFailure(replicaID ReplicaID, instanceID int, received, requi
 // === Instance State Logging ===
 
 func LogInstanceStateChange(replicaID ReplicaID, instanceID int, oldState, newState InstanceStatus, instance *EPaxosInstance) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogInstanceStateChange || GetLogger() == nil {
 		return
 	}
 
@@ -200,7 +301,7 @@ func LogInstanceStateChange(replicaID ReplicaID, instanceID int, oldState, newSt
 // === Execution Logging ===
 
 func LogExecutionAttempt(replicaID ReplicaID, instanceID int, instance *EPaxosInstance) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogExecutionAttempt || GetLogger() == nil {
 		return
 	}
 
@@ -221,7 +322,7 @@ func LogExecutionAttempt(replicaID ReplicaID, instanceID int, instance *EPaxosIn
 }
 
 func LogExecutionSuccess(replicaID ReplicaID, instanceID int, command Command, cmdID CommandID, result string, duration time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogExecutionSuccess || GetLogger() == nil {
 		return
 	}
 
@@ -235,7 +336,7 @@ func LogExecutionSuccess(replicaID ReplicaID, instanceID int, command Command, c
 }
 
 func LogExecutionFailure(replicaID ReplicaID, instanceID int, command Command, cmdID CommandID, err error) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogExecutionFailure || GetLogger() == nil {
 		return
 	}
 
@@ -248,7 +349,7 @@ func LogExecutionFailure(replicaID ReplicaID, instanceID int, command Command, c
 }
 
 func LogExecutionOrder(replicaID ReplicaID, instanceID int, order int, sccSize int, graphSize int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogExecutionOrder || GetLogger() == nil {
 		return
 	}
 
@@ -263,11 +364,11 @@ func LogExecutionOrder(replicaID ReplicaID, instanceID int, order int, sccSize i
 
 func LogConflictDetection(replicaID ReplicaID, instanceID int, otherReplicaID int, otherInstanceID int,
 	command Command, otherCommand Command) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogConflictDetection || GetLogger() == nil {
 		return
 	}
 
-	GetLogger().Log(DEBUG, DEPENDENCY, "Command conflict detected").
+	GetLogger().Log(INFO, DEPENDENCY, "Command conflict detected").
 		WithInstance(int(replicaID), instanceID).
 		WithCommand(command, CommandID{}).
 		WithContext("conflicting_instance", fmt.Sprintf("R%d.%d", otherReplicaID, otherInstanceID)).
@@ -277,7 +378,7 @@ func LogConflictDetection(replicaID ReplicaID, instanceID int, otherReplicaID in
 }
 
 func LogDependencyAdded(replicaID ReplicaID, instanceID int, depReplicaID int, depInstanceID int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogDependencyAdded || GetLogger() == nil {
 		return
 	}
 
@@ -289,7 +390,7 @@ func LogDependencyAdded(replicaID ReplicaID, instanceID int, depReplicaID int, d
 }
 
 func LogDependencyGraphBuilt(replicaID ReplicaID, instanceID int, nodeCount int, edgeCount int, sccCount int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogDependencyGraphBuilt || GetLogger() == nil {
 		return
 	}
 
@@ -303,7 +404,7 @@ func LogDependencyGraphBuilt(replicaID ReplicaID, instanceID int, nodeCount int,
 }
 
 func LogMissingDependencies(replicaID ReplicaID, instanceID int, missingDeps []string) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogMissingDependencies || GetLogger() == nil {
 		return
 	}
 
@@ -317,7 +418,7 @@ func LogMissingDependencies(replicaID ReplicaID, instanceID int, missingDeps []s
 // === Network and RPC Logging ===
 
 func LogRPCCall(replicaID ReplicaID, target string, method string, args interface{}, startTime time.Time) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogRPCCall || GetLogger() == nil {
 		return
 	}
 
@@ -330,7 +431,7 @@ func LogRPCCall(replicaID ReplicaID, target string, method string, args interfac
 }
 
 func LogRPCReceive(replicaID ReplicaID, method string, args interface{}) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogRPCReceive || GetLogger() == nil {
 		return
 	}
 
@@ -342,7 +443,7 @@ func LogRPCReceive(replicaID ReplicaID, method string, args interface{}) {
 }
 
 func LogRPCComplete(replicaID ReplicaID, target string, method string, duration time.Duration, success bool, err error) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogRPCComplete || GetLogger() == nil {
 		return
 	}
 
@@ -365,7 +466,7 @@ func LogRPCComplete(replicaID ReplicaID, target string, method string, duration 
 }
 
 func LogNetworkPartition(replicaID ReplicaID, unreachablePeers []string) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogNetworkPartition || GetLogger() == nil {
 		return
 	}
 
@@ -379,7 +480,7 @@ func LogNetworkPartition(replicaID ReplicaID, unreachablePeers []string) {
 // === Recovery Logging ===
 
 func LogRecoveryStart(replicaID ReplicaID, targetReplicaID int, instanceID int, reason string, attempt int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogRecoveryStart || GetLogger() == nil {
 		return
 	}
 
@@ -391,7 +492,7 @@ func LogRecoveryStart(replicaID ReplicaID, targetReplicaID int, instanceID int, 
 }
 
 func LogRecoveryComplete(replicaID ReplicaID, targetReplicaID int, instanceID int, success bool, duration time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogRecoveryComplete || GetLogger() == nil {
 		return
 	}
 
@@ -411,7 +512,7 @@ func LogRecoveryComplete(replicaID ReplicaID, targetReplicaID int, instanceID in
 }
 
 func LogPreparePhase(replicaID ReplicaID, targetReplicaID int, instanceID int, ballot Ballot) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogPreparePhase || GetLogger() == nil {
 		return
 	}
 
@@ -424,7 +525,7 @@ func LogPreparePhase(replicaID ReplicaID, targetReplicaID int, instanceID int, b
 }
 
 func LogPrepareResponse(replicaID ReplicaID, targetReplicaID int, instanceID int, fromReplica int, success bool, committed bool, instance *EPaxosInstance) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogPrepareResponse || GetLogger() == nil {
 		return
 	}
 
@@ -453,7 +554,7 @@ func LogPrepareResponse(replicaID ReplicaID, targetReplicaID int, instanceID int
 // === Client and Replica Lifecycle Logging ===
 
 func LogReplicaStart(replicaID ReplicaID, address string, peers []string) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogReplicaStart || GetLogger() == nil {
 		return
 	}
 
@@ -466,7 +567,7 @@ func LogReplicaStart(replicaID ReplicaID, address string, peers []string) {
 }
 
 func LogReplicaShutdown(replicaID ReplicaID, reason string) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogReplicaShutdown || GetLogger() == nil {
 		return
 	}
 
@@ -477,7 +578,7 @@ func LogReplicaShutdown(replicaID ReplicaID, reason string) {
 }
 
 func LogClientRequest(replicaID ReplicaID, command Command, cmdID CommandID, commandCount int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogClientRequest || GetLogger() == nil {
 		return
 	}
 
@@ -490,7 +591,7 @@ func LogClientRequest(replicaID ReplicaID, command Command, cmdID CommandID, com
 }
 
 func LogClientResponse(replicaID ReplicaID, command Command, cmdID CommandID, success bool, result string, duration time.Duration, err error) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogClientResponse || GetLogger() == nil {
 		return
 	}
 
@@ -518,7 +619,7 @@ func LogClientResponse(replicaID ReplicaID, command Command, cmdID CommandID, su
 // === Storage Logging ===
 
 func LogKVStoreOperation(replicaID ReplicaID, operation string, key string, value string, success bool, err error, duration time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogKVStoreOperation || GetLogger() == nil {
 		return
 	}
 
@@ -541,7 +642,7 @@ func LogKVStoreOperation(replicaID ReplicaID, operation string, key string, valu
 }
 
 func LogKVStoreStats(replicaID ReplicaID, totalKeys int, totalOperations int64, avgLatency time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogKVStoreStats || GetLogger() == nil {
 		return
 	}
 
@@ -556,7 +657,7 @@ func LogKVStoreStats(replicaID ReplicaID, totalKeys int, totalOperations int64, 
 // === Performance and Metrics Logging ===
 
 func LogPerformanceMetrics(replicaID ReplicaID, metrics map[string]interface{}) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogPerformanceMetrics || GetLogger() == nil {
 		return
 	}
 
@@ -568,7 +669,7 @@ func LogPerformanceMetrics(replicaID ReplicaID, metrics map[string]interface{}) 
 }
 
 func LogThroughputMetrics(replicaID ReplicaID, commandsPerSecond float64, period time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogThroughputMetrics || GetLogger() == nil {
 		return
 	}
 
@@ -580,7 +681,7 @@ func LogThroughputMetrics(replicaID ReplicaID, commandsPerSecond float64, period
 }
 
 func LogLatencyMetrics(replicaID ReplicaID, avgLatency, p50, p95, p99 time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogLatencyMetrics || GetLogger() == nil {
 		return
 	}
 
@@ -596,7 +697,7 @@ func LogLatencyMetrics(replicaID ReplicaID, avgLatency, p50, p95, p99 time.Durat
 // === Error and Alert Logging ===
 
 func LogCriticalError(replicaID ReplicaID, component string, err error, context map[string]interface{}) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogCriticalError || GetLogger() == nil {
 		return
 	}
 
@@ -612,7 +713,7 @@ func LogCriticalError(replicaID ReplicaID, component string, err error, context 
 }
 
 func LogConsensusTimeout(replicaID ReplicaID, instanceID int, phase string, timeout time.Duration) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogConsensusTimeout || GetLogger() == nil {
 		return
 	}
 
@@ -625,7 +726,7 @@ func LogConsensusTimeout(replicaID ReplicaID, instanceID int, phase string, time
 }
 
 func LogQuorumFailure(replicaID ReplicaID, instanceID int, phase string, received int, required int) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogQuorumFailure || GetLogger() == nil {
 		return
 	}
 
@@ -640,7 +741,7 @@ func LogQuorumFailure(replicaID ReplicaID, instanceID int, phase string, receive
 // === Debugging and Development Logging ===
 
 func LogDebugState(replicaID ReplicaID, component string, state map[string]interface{}) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogDebugState || GetLogger() == nil {
 		return
 	}
 
@@ -655,7 +756,7 @@ func LogDebugState(replicaID ReplicaID, component string, state map[string]inter
 }
 
 func LogInstanceDump(replicaID ReplicaID, instanceID int, instance *EPaxosInstance) {
-	if GetLogger() == nil {
+	if !logConfig.EnableLogInstanceDump || GetLogger() == nil {
 		return
 	}
 
