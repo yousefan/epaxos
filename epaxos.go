@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net/rpc"
 	"time"
 )
 
@@ -256,171 +255,171 @@ func (r *ReplicaRPC) Prepare(args PrepareArgs, reply *PrepareReply) error {
 
 // === RPC Senders with Timeouts ===
 
-func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, error) {
-	startTime := time.Now()
-
-	// Create a channel to receive the result
-	type rpcResult struct {
-		reply *PreAcceptReply
-		err   error
-	}
-
-	resultChan := make(chan rpcResult, 1)
-
-	go func() {
-		client, err := rpc.Dial("tcp", address)
-		if err != nil {
-			resultChan <- rpcResult{nil, err}
-			return
-		}
-		defer client.Close()
-
-		var reply PreAcceptReply
-		err = client.Call("ReplicaRPC.PreAccept", args, &reply)
-		resultChan <- rpcResult{&reply, err}
-	}()
-
-	// Wait for result or timeout
-	select {
-	case result := <-resultChan:
-		duration := time.Since(startTime)
-		success := result.err == nil
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, success, result.err)
-
-		return result.reply, result.err
-	case <-time.After(5 * time.Second):
-		duration := time.Since(startTime)
-		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, false, timeoutErr)
-
-		return nil, timeoutErr
-	}
-}
-
-func SendAcceptToPeer(address string, args AcceptArgs) (*AcceptReply, error) {
-	startTime := time.Now()
-
-	type rpcResult struct {
-		reply *AcceptReply
-		err   error
-	}
-
-	resultChan := make(chan rpcResult, 1)
-
-	go func() {
-		client, err := rpc.Dial("tcp", address)
-		if err != nil {
-			resultChan <- rpcResult{nil, err}
-			return
-		}
-		defer client.Close()
-
-		var reply AcceptReply
-		err = client.Call("ReplicaRPC.Accept", args, &reply)
-		resultChan <- rpcResult{&reply, err}
-	}()
-
-	select {
-	case result := <-resultChan:
-		duration := time.Since(startTime)
-		success := result.err == nil
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, success, result.err)
-
-		return result.reply, result.err
-	case <-time.After(5 * time.Second):
-		duration := time.Since(startTime)
-		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, false, timeoutErr)
-
-		return nil, timeoutErr
-	}
-}
-
-func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
-	startTime := time.Now()
-
-	type rpcResult struct {
-		reply *CommitReply
-		err   error
-	}
-
-	resultChan := make(chan rpcResult, 1)
-
-	go func() {
-		client, err := rpc.Dial("tcp", address)
-		if err != nil {
-			resultChan <- rpcResult{nil, err}
-			return
-		}
-		defer client.Close()
-
-		var reply CommitReply
-		err = client.Call("ReplicaRPC.Commit", args, &reply)
-		resultChan <- rpcResult{&reply, err}
-	}()
-
-	select {
-	case result := <-resultChan:
-		duration := time.Since(startTime)
-		success := result.err == nil
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, success, result.err)
-
-		return result.reply, result.err
-	case <-time.After(5 * time.Second):
-		duration := time.Since(startTime)
-		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, false, timeoutErr)
-
-		return nil, timeoutErr
-	}
-}
-
-func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) {
-	startTime := time.Now()
-
-	type rpcResult struct {
-		reply *PrepareReply
-		err   error
-	}
-
-	resultChan := make(chan rpcResult, 1)
-
-	go func() {
-		client, err := rpc.Dial("tcp", address)
-		if err != nil {
-			resultChan <- rpcResult{nil, err}
-			return
-		}
-		defer client.Close()
-
-		var reply PrepareReply
-		err = client.Call("ReplicaRPC.Prepare", args, &reply)
-		resultChan <- rpcResult{&reply, err}
-	}()
-
-	select {
-	case result := <-resultChan:
-		duration := time.Since(startTime)
-		success := result.err == nil
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, success, result.err)
-
-		return result.reply, result.err
-	case <-time.After(5 * time.Second):
-		duration := time.Since(startTime)
-		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-
-		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, false, timeoutErr)
-
-		return nil, timeoutErr
-	}
-}
+//func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, error) {
+//	startTime := time.Now()
+//
+//	// Create a channel to receive the result
+//	type rpcResult struct {
+//		reply *PreAcceptReply
+//		err   error
+//	}
+//
+//	resultChan := make(chan rpcResult, 1)
+//
+//	go func() {
+//		client, err := rpc.Dial("tcp", address)
+//		if err != nil {
+//			resultChan <- rpcResult{nil, err}
+//			return
+//		}
+//		defer client.Close()
+//
+//		var reply PreAcceptReply
+//		err = client.Call("ReplicaRPC.PreAccept", args, &reply)
+//		resultChan <- rpcResult{&reply, err}
+//	}()
+//
+//	// Wait for result or timeout
+//	select {
+//	case result := <-resultChan:
+//		duration := time.Since(startTime)
+//		success := result.err == nil
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, success, result.err)
+//
+//		return result.reply, result.err
+//	case <-time.After(5 * time.Second):
+//		duration := time.Since(startTime)
+//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, false, timeoutErr)
+//
+//		return nil, timeoutErr
+//	}
+//}
+//
+//func SendAcceptToPeer(address string, args AcceptArgs) (*AcceptReply, error) {
+//	startTime := time.Now()
+//
+//	type rpcResult struct {
+//		reply *AcceptReply
+//		err   error
+//	}
+//
+//	resultChan := make(chan rpcResult, 1)
+//
+//	go func() {
+//		client, err := rpc.Dial("tcp", address)
+//		if err != nil {
+//			resultChan <- rpcResult{nil, err}
+//			return
+//		}
+//		defer client.Close()
+//
+//		var reply AcceptReply
+//		err = client.Call("ReplicaRPC.Accept", args, &reply)
+//		resultChan <- rpcResult{&reply, err}
+//	}()
+//
+//	select {
+//	case result := <-resultChan:
+//		duration := time.Since(startTime)
+//		success := result.err == nil
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, success, result.err)
+//
+//		return result.reply, result.err
+//	case <-time.After(5 * time.Second):
+//		duration := time.Since(startTime)
+//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, false, timeoutErr)
+//
+//		return nil, timeoutErr
+//	}
+//}
+//
+//func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
+//	startTime := time.Now()
+//
+//	type rpcResult struct {
+//		reply *CommitReply
+//		err   error
+//	}
+//
+//	resultChan := make(chan rpcResult, 1)
+//
+//	go func() {
+//		client, err := rpc.Dial("tcp", address)
+//		if err != nil {
+//			resultChan <- rpcResult{nil, err}
+//			return
+//		}
+//		defer client.Close()
+//
+//		var reply CommitReply
+//		err = client.Call("ReplicaRPC.Commit", args, &reply)
+//		resultChan <- rpcResult{&reply, err}
+//	}()
+//
+//	select {
+//	case result := <-resultChan:
+//		duration := time.Since(startTime)
+//		success := result.err == nil
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, success, result.err)
+//
+//		return result.reply, result.err
+//	case <-time.After(5 * time.Second):
+//		duration := time.Since(startTime)
+//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, false, timeoutErr)
+//
+//		return nil, timeoutErr
+//	}
+//}
+//
+//func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) {
+//	startTime := time.Now()
+//
+//	type rpcResult struct {
+//		reply *PrepareReply
+//		err   error
+//	}
+//
+//	resultChan := make(chan rpcResult, 1)
+//
+//	go func() {
+//		client, err := rpc.Dial("tcp", address)
+//		if err != nil {
+//			resultChan <- rpcResult{nil, err}
+//			return
+//		}
+//		defer client.Close()
+//
+//		var reply PrepareReply
+//		err = client.Call("ReplicaRPC.Prepare", args, &reply)
+//		resultChan <- rpcResult{&reply, err}
+//	}()
+//
+//	select {
+//	case result := <-resultChan:
+//		duration := time.Since(startTime)
+//		success := result.err == nil
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, success, result.err)
+//
+//		return result.reply, result.err
+//	case <-time.After(5 * time.Second):
+//		duration := time.Since(startTime)
+//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+//
+//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, false, timeoutErr)
+//
+//		return nil, timeoutErr
+//	}
+//}
 
 // runLocalPreAccept runs PreAccept logic locally and returns the result
 func (r *Replica) runLocalPreAccept(command Command, cmdID CommandID, seq int, deps []Dependency, ballot Ballot) (int, []Dependency) {

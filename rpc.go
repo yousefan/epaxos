@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"net/rpc"
+	"sync"
 	"time"
 )
 
@@ -111,9 +112,11 @@ func StartRPCServer(replica *Replica, address string) error {
 	return nil
 }
 
-// === Client Call Utility ===
+// === Client Call Utility (used by external client binaries) ===
 
 func SendClientCommand(address string, cmd Command, commandCount int) (*ClientReply, error) {
+	// Note: This is used by non-replica clients; it can remain one-off.
+	// Your load generator now pools on its side anyway.
 	client, err := rpc.Dial("tcp", address)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to replica: %w", err)
@@ -137,6 +140,132 @@ func SendClientCommand(address string, cmd Command, commandCount int) (*ClientRe
 	err = client.Call("ReplicaRPC.ClientPropose", req, &reply)
 	if err != nil {
 		return nil, fmt.Errorf("RPC call failed: %w", err)
+	}
+	return &reply, nil
+}
+
+// ============================================================================
+//                         PERSISTENT RPC CLIENT POOL
+// ============================================================================
+
+type rpcClientPool struct {
+	mu      sync.RWMutex
+	clients map[string]*rpc.Client
+}
+
+var pool rpcClientPool
+
+func (p *rpcClientPool) get(address string) (*rpc.Client, error) {
+	p.mu.RLock()
+	c := p.clients[address]
+	p.mu.RUnlock()
+	if c != nil {
+		return c, nil
+	}
+
+	// Dial under write lock (double-check)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.clients == nil {
+		p.clients = make(map[string]*rpc.Client)
+	}
+	if c = p.clients[address]; c != nil {
+		return c, nil
+	}
+	client, err := rpc.Dial("tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	p.clients[address] = client
+	return client, nil
+}
+
+func (p *rpcClientPool) invalidate(address string) {
+	p.mu.Lock()
+	if p.clients == nil {
+		p.mu.Unlock()
+		return
+	}
+	if c, ok := p.clients[address]; ok && c != nil {
+		_ = c.Close()
+	}
+	delete(p.clients, address)
+	p.mu.Unlock()
+}
+
+// callWithTimeout performs client.Call with a timeout and one retry on error.
+// method must be like "ReplicaRPC.PreAccept".
+func callWithTimeout[T any](address, method string, args any, reply *T) error {
+	startTime := time.Now()
+
+	type rpcResult struct {
+		err error
+	}
+
+	doCall := func() error {
+		client, err := pool.get(address)
+		if err != nil {
+			return err
+		}
+		done := make(chan rpcResult, 1)
+		go func() {
+			err := client.Call(method, args, reply)
+			done <- rpcResult{err: err}
+		}()
+
+		select {
+		case r := <-done:
+			LogRPCComplete(ReplicaID(0), address, method, time.Since(startTime), r.err == nil, r.err) // ReplicaID not critical for transport log
+			return r.err
+		case <-time.After(5 * time.Second):
+			timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
+			LogRPCComplete(ReplicaID(0), address, method, time.Since(startTime), false, timeoutErr)
+			return timeoutErr
+		}
+	}
+
+	// First attempt
+	if err := doCall(); err != nil {
+		// Invalidate and retry once
+		pool.invalidate(address)
+		// Second attempt (fresh connection)
+		return doCall()
+	}
+	return nil
+}
+
+// ============================================================================
+//                         REPLICA-TO-REPLICA SENDERS
+// ============================================================================
+
+func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, error) {
+	var reply PreAcceptReply
+	if err := callWithTimeout(address, "ReplicaRPC.PreAccept", args, &reply); err != nil {
+		return nil, err
+	}
+	return &reply, nil
+}
+
+func SendAcceptToPeer(address string, args AcceptArgs) (*AcceptReply, error) {
+	var reply AcceptReply
+	if err := callWithTimeout(address, "ReplicaRPC.Accept", args, &reply); err != nil {
+		return nil, err
+	}
+	return &reply, nil
+}
+
+func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
+	var reply CommitReply
+	if err := callWithTimeout(address, "ReplicaRPC.Commit", args, &reply); err != nil {
+		return nil, err
+	}
+	return &reply, nil
+}
+
+func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) {
+	var reply PrepareReply
+	if err := callWithTimeout(address, "ReplicaRPC.Prepare", args, &reply); err != nil {
+		return nil, err
 	}
 	return &reply, nil
 }

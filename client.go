@@ -138,7 +138,7 @@ func main() {
 	const (
 		testDuration = 10 * time.Second
 		concurrency  = 5
-		conflictProb = 0.0
+		conflictProb = 0.75
 		sharedKey    = "share_key"
 		valueBytes   = 16
 	)
