@@ -100,12 +100,15 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 	newDeps := make([]Dependency, len(args.Deps))
 	copy(newDeps, args.Deps)
 
+	hasConflict := false
+
 	for rid, instanceMap := range r.Replica.Instances {
 		for iid, inst := range instanceMap {
 			if inst == nil || inst.CommandID == args.CommandID {
 				continue
 			}
 			if commandsConflict(inst.Command, args.Command) {
+				hasConflict = true
 				LogConflictDetection(args.ReplicaID, args.InstanceID, rid, iid, args.Command, inst.Command)
 
 				// Adjust sequence number
@@ -118,6 +121,10 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 				newDeps = appendDependencyIfMissing(newDeps, rid, iid)
 			}
 		}
+	}
+
+	if hasConflict {
+		IncrementConflictDetect()
 	}
 
 	// NEW: Check if attributes were changed from the leader's proposal
@@ -458,6 +465,8 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	r.NextInstance++
 	r.InstanceLock.Unlock()
 
+	IncrementTotalRequests()
+
 	// Calculate proper fast-path quorum size: F + ⌈(F+1)/2⌉
 	f := len(r.Peers) / 2         // Number of tolerated failures
 	fastPathQuorum := f + (f+1)/2 // ⌈(F+1)/2⌉ = (F+1+1)/2 for integer division
@@ -587,6 +596,8 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 	if canUseFastPath {
 		// Enhanced fast path logging
 
+		IncrementFastPath()
+
 		commitArgs := CommitArgs{
 			ReplicaID:  r.ID,
 			InstanceID: instanceID,
@@ -623,6 +634,8 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 
 		return nil
 	}
+
+	IncrementSlowPath()
 
 	// Slow path with enhanced logging
 	reason := fmt.Sprintf("unchanged_responses=%d, required=%d, identical=%v",
