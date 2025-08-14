@@ -94,6 +94,32 @@ func (r *ReplicaRPC) ClientPropose(req ClientRequest, reply *ClientReply) error 
 	return nil
 }
 
+func (r *ReplicaRPC) GetMetrics(req MetricsRequest, reply *MetricsReply) error {
+	// Get current metrics
+	totalReqs, fastPath, slowPath, conflicts := GetMetrics()
+
+	// Fill the reply
+	reply.TotalRequests = totalReqs
+	reply.FastPathCount = fastPath
+	reply.SlowPathCount = slowPath
+	reply.ConflictCount = conflicts
+
+	// Reset if requested
+	if req.Reset {
+		ResetMetrics()
+
+		GetLogger().Log(INFO, GENERAL, "Metrics reset by client request").
+			WithContext("total_requests_before_reset", totalReqs).
+			WithContext("fast_path_before_reset", fastPath).
+			WithContext("slow_path_before_reset", slowPath).
+			WithContext("conflicts_before_reset", conflicts).
+			WithTags("metrics", "reset").
+			Send()
+	}
+
+	return nil
+}
+
 // === Server Initialization ===
 
 func StartRPCServer(replica *Replica, address string) error {
