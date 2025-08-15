@@ -95,3 +95,72 @@ func getMaxSeq(replies []PreAcceptReply) int {
 	}
 	return maxSeq
 }
+
+func (r *Replica) onCommitted(rid, iid int) {
+	r.InstanceLock.Lock()
+	defer r.InstanceLock.Unlock()
+
+	inst := r.Instances[rid][iid]
+	if inst == nil {
+		return
+	}
+
+	// Build reverse edges once
+	key := makeKey(rid, iid)
+	if _, ok := r.remainingDeps[key]; !ok {
+		// count how many deps are not yet executed
+		unexec := 0
+		for _, d := range inst.Deps {
+			dkey := makeKey(d.ReplicaID, d.InstanceID)
+			// register reverse edge: d -> (rid,iid)
+			r.dependents[dkey] = append(r.dependents[dkey], instKey{rid, iid})
+
+			if depMap, ok := r.Instances[d.ReplicaID]; !ok {
+				unexec++
+			} else if depInst, ok := depMap[d.InstanceID]; !ok || !depInst.Executed {
+				unexec++
+			}
+		}
+		r.remainingDeps[key] = unexec
+	}
+
+	// If all deps already executed, mark runnable
+	if r.remainingDeps[key] == 0 {
+		r.enqueueReadyLocked(instKey{rid, iid})
+	} else {
+		// still blocked; do nothing until deps complete
+	}
+}
+
+func (r *Replica) enqueueReadyLocked(k instKey) {
+	key := makeKey(k.rid, k.iid)
+	if _, seen := r.pending[key]; seen {
+		return
+	}
+	r.pending[key] = struct{}{}
+	select {
+	case r.readyCh <- k:
+	default:
+		// queue full: fall back once (non-blocking drop) or log & use blocking send
+		r.readyCh <- k
+	}
+}
+
+func (r *Replica) onExecuted(rid, iid int) {
+	r.InstanceLock.Lock()
+	defer r.InstanceLock.Unlock()
+
+	key := makeKey(rid, iid)
+	for _, dep := range r.dependents[key] {
+		dkey := makeKey(dep.rid, dep.iid)
+		if cnt, ok := r.remainingDeps[dkey]; ok && cnt > 0 {
+			cnt--
+			r.remainingDeps[dkey] = cnt
+			if cnt == 0 {
+				r.enqueueReadyLocked(dep)
+			}
+		}
+	}
+	// Optional: free memory
+	delete(r.dependents, key)
+}

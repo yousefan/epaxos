@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+type instKey struct{ rid, iid int }
+
 // Replica represents a single EPaxos node in the cluster
 type Replica struct {
 	ID           ReplicaID                       // Unique ID for this replica
@@ -16,6 +18,11 @@ type Replica struct {
 
 	NextInstance int // Next available instance slot
 	KVStore      *KVStore
+
+	readyCh       chan instKey         // bounded queue of runnable (or newly committed) instances
+	pending       map[string]struct{}  // de-dupe keys already in the queue
+	dependents    map[string][]instKey // reverse edges: X -> list that depend on X
+	remainingDeps map[string]int       // (rid,iid) -> count of unexecuted deps
 }
 
 // NewReplica creates a new replica with the given ID and peers
@@ -24,11 +31,15 @@ func NewReplica(id ReplicaID, peers []string) *Replica {
 		peers = []string{}
 	}
 	return &Replica{
-		ID:           id,
-		Peers:        peers,
-		Instances:    make(map[int]map[int]*EPaxosInstance),
-		NextInstance: 0,
-		KVStore:      NewKVStore(),
+		ID:            id,
+		Peers:         peers,
+		Instances:     make(map[int]map[int]*EPaxosInstance),
+		NextInstance:  0,
+		KVStore:       NewKVStore(),
+		readyCh:       make(chan instKey, 4096),
+		pending:       make(map[string]struct{}),
+		dependents:    make(map[string][]instKey),
+		remainingDeps: make(map[string]int),
 	}
 }
 
