@@ -76,7 +76,6 @@ type PrepareReply struct {
 // === ReplicaRPC Additions ===
 
 func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error {
-
 	LogPreAcceptPhase(args.ReplicaID, args.InstanceID, args.Command, args.CommandID)
 
 	r.Replica.InstanceLock.Lock()
@@ -95,13 +94,15 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 		}
 	}
 
-	// === Conflict Detection ===
+	// === Bounded Conflict Detection ===
 	maxSeq := args.Seq
 	newDeps := make([]Dependency, len(args.Deps))
 	copy(newDeps, args.Deps)
 
-	e := r.Replica.keyIndex[args.Command.Key]
+	// Only check conflicts with uncommitted instances
+	e := r.Replica.committedIndex[args.Command.Key]
 	if e != nil {
+		currentTime := time.Now()
 		// Which set to scan depends on op type:
 		if args.Command.Type == CmdPut {
 			// PUT conflicts with writers + readers
@@ -110,19 +111,33 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 				maxSeq = e.maxSeq + 1
 			}
 
-			// add deps for writers
+			// add deps for writers (but filter old ones)
 			for _, ik := range e.writers {
 				if ik.rid == int(args.ReplicaID) && ik.iid == args.InstanceID {
 					continue
 				}
-				newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+				// Check if instance is recent enough
+				if instMap, ok := r.Replica.Instances[ik.rid]; ok {
+					if inst, ok := instMap[ik.iid]; ok {
+						if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.Replica.maxDependencyAge) * time.Millisecond)) {
+							newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+						}
+					}
+				}
 			}
-			// add deps for readers (GET vs PUT)
+			// add deps for readers (GET vs PUT) with age check
 			for _, ik := range e.readers {
 				if ik.rid == int(args.ReplicaID) && ik.iid == args.InstanceID {
 					continue
 				}
-				newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+				// Check if instance is recent enough
+				if instMap, ok := r.Replica.Instances[ik.rid]; ok {
+					if inst, ok := instMap[ik.iid]; ok {
+						if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.Replica.maxDependencyAge) * time.Millisecond)) {
+							newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+						}
+					}
+				}
 			}
 
 		} else { // GET
@@ -136,12 +151,19 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 				if ik.rid == int(args.ReplicaID) && ik.iid == args.InstanceID {
 					continue
 				}
-				newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+				// Check if instance is recent enough
+				if instMap, ok := r.Replica.Instances[ik.rid]; ok {
+					if inst, ok := instMap[ik.iid]; ok {
+						if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.Replica.maxDependencyAge) * time.Millisecond)) {
+							newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+						}
+					}
+				}
 			}
 		}
 	}
 
-	// NEW: Check if attributes were changed from the leader's proposal
+	// Check if attributes were changed from the leader's proposal
 	attributesUnchanged := (maxSeq == args.Seq && equalDependencySlice(newDeps, args.Deps))
 
 	// Save the instance
@@ -153,18 +175,17 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 		Status:              StatusPreAccepted,
 		Ballot:              args.Ballot,
 		AttributesUnchanged: attributesUnchanged,
+		Timestamp:           Timestamp{Time: time.Now(), Count: 0},
 	}
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 	r.Replica.indexAdd(inst, int(args.ReplicaID), args.InstanceID)
+
 	// Reply
 	reply.OK = true
 	reply.Seq = maxSeq
 	reply.Deps = newDeps
 	reply.Ballot = args.Ballot
-	reply.AttributesUnchanged = attributesUnchanged // NEW: Include in reply
-
-	//LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID,
-	//	args.Seq, maxSeq, args.Deps, newDeps, true, attributesUnchanged)
+	reply.AttributesUnchanged = attributesUnchanged
 
 	return nil
 }
@@ -208,7 +229,6 @@ func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
 }
 
 func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
-
 	LogCommitPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps)
 
 	r.Replica.InstanceLock.Lock()
@@ -224,12 +244,14 @@ func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
 		Status:    StatusCommitted,
 		Committed: true,
 		Ballot:    args.Ballot,
+		Timestamp: Timestamp{Time: time.Now(), Count: 0},
 	}
-	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
-	r.Replica.indexAdd(inst, int(args.ReplicaID), args.InstanceID)
-	r.Replica.InstanceLock.Unlock()
 
-	//LogCommitResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, true)
+	// Remove from uncommitted index since it's now committed
+	r.Replica.indexRemoveFromCommitted(args.Command, int(args.ReplicaID), args.InstanceID)
+
+	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
+	r.Replica.InstanceLock.Unlock()
 
 	// Try to execute right after committing
 	r.Replica.onCommitted(int(args.ReplicaID), args.InstanceID)
@@ -275,7 +297,6 @@ func (r *ReplicaRPC) Prepare(args PrepareArgs, reply *PrepareReply) error {
 	return nil
 }
 
-// runLocalPreAccept runs PreAccept logic locally and returns the result
 func (r *Replica) runLocalPreAccept(command Command, cmdID CommandID, seq int, deps []Dependency, ballot Ballot) (int, []Dependency) {
 	r.InstanceLock.RLock()
 	defer r.InstanceLock.RUnlock()
@@ -284,29 +305,53 @@ func (r *Replica) runLocalPreAccept(command Command, cmdID CommandID, seq int, d
 	newDeps := make([]Dependency, len(deps))
 	copy(newDeps, deps)
 
-	e := r.keyIndex[command.Key]
+	// Only check conflicts with uncommitted instances
+	e := r.committedIndex[command.Key]
 	if e == nil {
 		return maxSeq, newDeps
 	}
 
-	// If you’re okay with a fast upper bound for bumping seq:
+	currentTime := time.Now()
+
+	// If you're okay with a fast upper bound for bumping seq:
 	bump := e.maxSeq
 	if bump >= maxSeq {
 		maxSeq = bump + 1
 	}
 
 	if command.Type == CmdPut {
-		// PUT conflicts with writers + readers
+		// PUT conflicts with writers + readers (but filter old ones)
 		for _, ik := range e.writers {
-			newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+			// Check if instance is recent enough
+			if instMap, ok := r.Instances[ik.rid]; ok {
+				if inst, ok := instMap[ik.iid]; ok {
+					if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+					}
+				}
+			}
 		}
 		for _, ik := range e.readers {
-			newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+			// Check if instance is recent enough
+			if instMap, ok := r.Instances[ik.rid]; ok {
+				if inst, ok := instMap[ik.iid]; ok {
+					if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+					}
+				}
+			}
 		}
 	} else { // GET
-		// GET conflicts only with writers
+		// GET conflicts only with writers (but filter old ones)
 		for _, ik := range e.writers {
-			newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+			// Check if instance is recent enough
+			if instMap, ok := r.Instances[ik.rid]; ok {
+				if inst, ok := instMap[ik.iid]; ok {
+					if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+					}
+				}
+			}
 		}
 	}
 

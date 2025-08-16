@@ -1,6 +1,9 @@
 package main
 
-import "sort"
+import (
+	"sort"
+	"time"
+)
 
 // commandsConflict determines if two commands interfere with each other
 func commandsConflict(a, b Command) bool {
@@ -105,30 +108,43 @@ func (r *Replica) onCommitted(rid, iid int) {
 		return
 	}
 
+	// Remove from uncommitted index since it's now committed (aggressive cleanup)
+	r.indexRemoveFromCommitted(inst.Command, rid, iid)
+
 	// Build reverse edges once
 	key := makeKey(rid, iid)
 	if _, ok := r.remainingDeps[key]; !ok {
-		// count how many deps are not yet executed
+		// count how many deps are not yet executed (with age limit)
 		unexec := 0
+		currentTime := time.Now()
 		for _, d := range inst.Deps {
-			dkey := makeKey(d.ReplicaID, d.InstanceID)
-			// register reverse edge: d -> (rid,iid)
-			r.dependents[dkey] = append(r.dependents[dkey], instKey{rid, iid})
+			// Skip old dependencies
+			if depMap, ok := r.Instances[d.ReplicaID]; ok {
+				if depInst, ok := depMap[d.InstanceID]; ok {
+					// Only count recent dependencies
+					if !depInst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						dkey := makeKey(d.ReplicaID, d.InstanceID)
+						// register reverse edge: d -> (rid,iid)
+						r.dependents[dkey] = append(r.dependents[dkey], instKey{rid, iid})
 
-			if depMap, ok := r.Instances[d.ReplicaID]; !ok {
-				unexec++
-			} else if depInst, ok := depMap[d.InstanceID]; !ok || !depInst.Executed {
+						if !depInst.Executed {
+							unexec++
+						}
+					}
+				}
+			} else {
+				// Instance doesn't exist yet
+				dkey := makeKey(d.ReplicaID, d.InstanceID)
+				r.dependents[dkey] = append(r.dependents[dkey], instKey{rid, iid})
 				unexec++
 			}
 		}
 		r.remainingDeps[key] = unexec
 	}
 
-	// If all deps already executed, mark runnable
+	// If all deps already executed (or too old to matter), mark runnable
 	if r.remainingDeps[key] == 0 {
 		r.enqueueReadyLocked(instKey{rid, iid})
-	} else {
-		// still blocked; do nothing until deps complete
 	}
 }
 
