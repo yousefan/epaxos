@@ -9,6 +9,15 @@ import (
 
 type instKey struct{ rid, iid int }
 
+type keyEntry struct {
+	// Instances still relevant for conflicts on this key:
+	writers map[string]instKey // PUTs (and any op treated as write)
+	readers map[string]instKey // GETs
+	// Optional speedups:
+	maxSeq int            // max Seq among active instances on this key
+	seqBy  map[string]int // instKey->Seq if you want exact max
+}
+
 // Replica represents a single EPaxos node in the cluster
 type Replica struct {
 	ID           ReplicaID                       // Unique ID for this replica
@@ -23,6 +32,7 @@ type Replica struct {
 	pending       map[string]struct{}  // de-dupe keys already in the queue
 	dependents    map[string][]instKey // reverse edges: X -> list that depend on X
 	remainingDeps map[string]int       // (rid,iid) -> count of unexecuted deps
+	keyIndex      map[string]*keyEntry
 }
 
 // NewReplica creates a new replica with the given ID and peers
@@ -40,8 +50,67 @@ func NewReplica(id ReplicaID, peers []string) *Replica {
 		pending:       make(map[string]struct{}),
 		dependents:    make(map[string][]instKey),
 		remainingDeps: make(map[string]int),
+		keyIndex:      make(map[string]*keyEntry),
 	}
 }
+
+func (r *Replica) ke(key string) *keyEntry {
+	e := r.keyIndex[key]
+	if e == nil {
+		e = &keyEntry{
+			writers: make(map[string]instKey),
+			readers: make(map[string]instKey),
+			seqBy:   make(map[string]int),
+		}
+		r.keyIndex[key] = e
+	}
+	return e
+}
+
+// indexAdd is called once when the instance becomes visible locally (on PreAccept/Accept/Commit save).
+func (r *Replica) indexAdd(inst *EPaxosInstance, rid, iid int) {
+	e := r.ke(inst.Command.Key)
+	k := ikey(rid, iid)
+	if inst.Command.Type == CmdPut {
+		e.writers[k] = instKey{rid, iid}
+	} else {
+		e.readers[k] = instKey{rid, iid}
+	}
+	// keep (approx) max sequence for quick bump
+	e.seqBy[k] = inst.Seq
+	if inst.Seq > e.maxSeq {
+		e.maxSeq = inst.Seq
+	}
+}
+
+// indexRemove is called once after Execute completes.
+func (r *Replica) indexRemove(cmd Command, rid, iid int) {
+	e := r.keyIndex[cmd.Key]
+	if e == nil {
+		return
+	}
+	k := ikey(rid, iid)
+	delete(e.writers, k)
+	delete(e.readers, k)
+	if s, ok := e.seqBy[k]; ok {
+		delete(e.seqBy, k)
+		if s >= e.maxSeq {
+			// recompute lazily only when necessary
+			e.maxSeq = 0
+			for _, v := range e.seqBy {
+				if v > e.maxSeq {
+					e.maxSeq = v
+				}
+			}
+		}
+	}
+	// Optional: if empty, delete the entry to keep memory tidy
+	if len(e.writers) == 0 && len(e.readers) == 0 {
+		delete(r.keyIndex, cmd.Key)
+	}
+}
+
+func ikey(rid, iid int) string { return fmt.Sprintf("%d-%d", rid, iid) }
 
 // DependencyGraph represents the dependency graph for execution
 type DependencyGraph struct {
@@ -358,6 +427,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	// Check if this is a no-op command
 	if inst.Command.Key == "__noop__" {
 		inst.Executed = true
+		r.indexRemove(inst.Command, replicaID, instanceID)
 		inst.Status = StatusExecuted
 		totalDuration := time.Since(startTime)
 		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, "noop", totalDuration)
@@ -368,6 +438,7 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	result, err := r.KVStore.ApplyCommand(inst.Command)
 
 	inst.Executed = true
+	r.indexRemove(inst.Command, replicaID, instanceID)
 	inst.Status = StatusExecuted
 
 	totalDuration := time.Since(startTime)
