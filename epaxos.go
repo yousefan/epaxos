@@ -76,7 +76,6 @@ type PrepareReply struct {
 // === ReplicaRPC Additions ===
 
 func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error {
-
 	LogPreAcceptPhase(args.ReplicaID, args.InstanceID, args.Command, args.CommandID)
 
 	r.Replica.InstanceLock.Lock()
@@ -95,39 +94,76 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 		}
 	}
 
-	// === Conflict Detection ===
+	// === Bounded Conflict Detection ===
 	maxSeq := args.Seq
 	newDeps := make([]Dependency, len(args.Deps))
 	copy(newDeps, args.Deps)
 
-	hasConflict := false
-
-	for rid, instanceMap := range r.Replica.Instances {
-		for iid, inst := range instanceMap {
-			if inst == nil || inst.CommandID == args.CommandID {
-				continue
+	// Only check conflicts with uncommitted instances
+	e := r.Replica.committedIndex[args.Command.Key]
+	if e != nil {
+		currentTime := time.Now()
+		// Which set to scan depends on op type:
+		if args.Command.Type == CmdPut {
+			// PUT conflicts with writers + readers
+			// bump seq against known max on this key
+			if e.maxSeq >= maxSeq {
+				maxSeq = e.maxSeq + 1
 			}
-			if commandsConflict(inst.Command, args.Command) {
-				hasConflict = true
-				LogConflictDetection(args.ReplicaID, args.InstanceID, rid, iid, args.Command, inst.Command)
 
-				// Adjust sequence number
-				if inst.Seq >= maxSeq {
-					maxSeq = inst.Seq + 1
+			// add deps for writers (but filter old ones)
+			for _, ik := range e.writers {
+				if ik.rid == int(args.ReplicaID) && ik.iid == args.InstanceID {
+					continue
 				}
+				// Check if instance is recent enough
+				if instMap, ok := r.Replica.Instances[ik.rid]; ok {
+					if inst, ok := instMap[ik.iid]; ok {
+						if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.Replica.maxDependencyAge) * time.Millisecond)) {
+							newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+						}
+					}
+				}
+			}
+			// add deps for readers (GET vs PUT) with age check
+			for _, ik := range e.readers {
+				if ik.rid == int(args.ReplicaID) && ik.iid == args.InstanceID {
+					continue
+				}
+				// Check if instance is recent enough
+				if instMap, ok := r.Replica.Instances[ik.rid]; ok {
+					if inst, ok := instMap[ik.iid]; ok {
+						if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.Replica.maxDependencyAge) * time.Millisecond)) {
+							newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+						}
+					}
+				}
+			}
 
-				// Add dependency on conflicting instance from ANY replica
-				LogDependencyAdded(args.ReplicaID, args.InstanceID, rid, iid)
-				newDeps = appendDependencyIfMissing(newDeps, rid, iid)
+		} else { // GET
+			// GET conflicts with writers only
+			// sequence bump is only needed relative to conflicting writers
+			if e.maxSeq >= maxSeq {
+				maxSeq = e.maxSeq + 1
+			}
+
+			for _, ik := range e.writers {
+				if ik.rid == int(args.ReplicaID) && ik.iid == args.InstanceID {
+					continue
+				}
+				// Check if instance is recent enough
+				if instMap, ok := r.Replica.Instances[ik.rid]; ok {
+					if inst, ok := instMap[ik.iid]; ok {
+						if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.Replica.maxDependencyAge) * time.Millisecond)) {
+							newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+						}
+					}
+				}
 			}
 		}
 	}
 
-	if hasConflict {
-		IncrementConflictDetect()
-	}
-
-	// NEW: Check if attributes were changed from the leader's proposal
+	// Check if attributes were changed from the leader's proposal
 	attributesUnchanged := (maxSeq == args.Seq && equalDependencySlice(newDeps, args.Deps))
 
 	// Save the instance
@@ -139,18 +175,17 @@ func (r *ReplicaRPC) PreAccept(args PreAcceptArgs, reply *PreAcceptReply) error 
 		Status:              StatusPreAccepted,
 		Ballot:              args.Ballot,
 		AttributesUnchanged: attributesUnchanged,
+		Timestamp:           Timestamp{Time: time.Now(), Count: 0},
 	}
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
+	r.Replica.indexAdd(inst, int(args.ReplicaID), args.InstanceID)
 
 	// Reply
 	reply.OK = true
 	reply.Seq = maxSeq
 	reply.Deps = newDeps
 	reply.Ballot = args.Ballot
-	reply.AttributesUnchanged = attributesUnchanged // NEW: Include in reply
-
-	//LogPreAcceptResponse(args.ReplicaID, args.InstanceID, r.Replica.ID,
-	//	args.Seq, maxSeq, args.Deps, newDeps, true, attributesUnchanged)
+	reply.AttributesUnchanged = attributesUnchanged
 
 	return nil
 }
@@ -185,7 +220,7 @@ func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
 	}
 
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
-
+	r.Replica.indexAdd(inst, int(args.ReplicaID), args.InstanceID)
 	reply.OK = true
 	reply.Ballot = args.Ballot
 
@@ -194,7 +229,6 @@ func (r *ReplicaRPC) Accept(args AcceptArgs, reply *AcceptReply) error {
 }
 
 func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
-
 	LogCommitPhase(args.ReplicaID, args.InstanceID, args.Seq, args.Deps)
 
 	r.Replica.InstanceLock.Lock()
@@ -210,14 +244,17 @@ func (r *ReplicaRPC) Commit(args CommitArgs, reply *CommitReply) error {
 		Status:    StatusCommitted,
 		Committed: true,
 		Ballot:    args.Ballot,
+		Timestamp: Timestamp{Time: time.Now(), Count: 0},
 	}
+
+	// Remove from uncommitted index since it's now committed
+	r.Replica.indexRemoveFromCommitted(args.Command, int(args.ReplicaID), args.InstanceID)
+
 	r.Replica.Instances[int(args.ReplicaID)][args.InstanceID] = inst
 	r.Replica.InstanceLock.Unlock()
 
-	//LogCommitResponse(args.ReplicaID, args.InstanceID, r.Replica.ID, true)
-
 	// Try to execute right after committing
-	go r.Replica.TryExecute(int(args.ReplicaID), args.InstanceID)
+	r.Replica.onCommitted(int(args.ReplicaID), args.InstanceID)
 
 	reply.OK = true
 	return nil
@@ -260,196 +297,60 @@ func (r *ReplicaRPC) Prepare(args PrepareArgs, reply *PrepareReply) error {
 	return nil
 }
 
-// === RPC Senders with Timeouts ===
-
-//func SendPreAcceptToPeer(address string, args PreAcceptArgs) (*PreAcceptReply, error) {
-//	startTime := time.Now()
-//
-//	// Create a channel to receive the result
-//	type rpcResult struct {
-//		reply *PreAcceptReply
-//		err   error
-//	}
-//
-//	resultChan := make(chan rpcResult, 1)
-//
-//	go func() {
-//		client, err := rpc.Dial("tcp", address)
-//		if err != nil {
-//			resultChan <- rpcResult{nil, err}
-//			return
-//		}
-//		defer client.Close()
-//
-//		var reply PreAcceptReply
-//		err = client.Call("ReplicaRPC.PreAccept", args, &reply)
-//		resultChan <- rpcResult{&reply, err}
-//	}()
-//
-//	// Wait for result or timeout
-//	select {
-//	case result := <-resultChan:
-//		duration := time.Since(startTime)
-//		success := result.err == nil
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, success, result.err)
-//
-//		return result.reply, result.err
-//	case <-time.After(5 * time.Second):
-//		duration := time.Since(startTime)
-//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.PreAccept", duration, false, timeoutErr)
-//
-//		return nil, timeoutErr
-//	}
-//}
-//
-//func SendAcceptToPeer(address string, args AcceptArgs) (*AcceptReply, error) {
-//	startTime := time.Now()
-//
-//	type rpcResult struct {
-//		reply *AcceptReply
-//		err   error
-//	}
-//
-//	resultChan := make(chan rpcResult, 1)
-//
-//	go func() {
-//		client, err := rpc.Dial("tcp", address)
-//		if err != nil {
-//			resultChan <- rpcResult{nil, err}
-//			return
-//		}
-//		defer client.Close()
-//
-//		var reply AcceptReply
-//		err = client.Call("ReplicaRPC.Accept", args, &reply)
-//		resultChan <- rpcResult{&reply, err}
-//	}()
-//
-//	select {
-//	case result := <-resultChan:
-//		duration := time.Since(startTime)
-//		success := result.err == nil
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, success, result.err)
-//
-//		return result.reply, result.err
-//	case <-time.After(5 * time.Second):
-//		duration := time.Since(startTime)
-//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Accept", duration, false, timeoutErr)
-//
-//		return nil, timeoutErr
-//	}
-//}
-//
-//func SendCommitToPeer(address string, args CommitArgs) (*CommitReply, error) {
-//	startTime := time.Now()
-//
-//	type rpcResult struct {
-//		reply *CommitReply
-//		err   error
-//	}
-//
-//	resultChan := make(chan rpcResult, 1)
-//
-//	go func() {
-//		client, err := rpc.Dial("tcp", address)
-//		if err != nil {
-//			resultChan <- rpcResult{nil, err}
-//			return
-//		}
-//		defer client.Close()
-//
-//		var reply CommitReply
-//		err = client.Call("ReplicaRPC.Commit", args, &reply)
-//		resultChan <- rpcResult{&reply, err}
-//	}()
-//
-//	select {
-//	case result := <-resultChan:
-//		duration := time.Since(startTime)
-//		success := result.err == nil
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, success, result.err)
-//
-//		return result.reply, result.err
-//	case <-time.After(5 * time.Second):
-//		duration := time.Since(startTime)
-//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Commit", duration, false, timeoutErr)
-//
-//		return nil, timeoutErr
-//	}
-//}
-//
-//func SendPrepareToPeer(address string, args PrepareArgs) (*PrepareReply, error) {
-//	startTime := time.Now()
-//
-//	type rpcResult struct {
-//		reply *PrepareReply
-//		err   error
-//	}
-//
-//	resultChan := make(chan rpcResult, 1)
-//
-//	go func() {
-//		client, err := rpc.Dial("tcp", address)
-//		if err != nil {
-//			resultChan <- rpcResult{nil, err}
-//			return
-//		}
-//		defer client.Close()
-//
-//		var reply PrepareReply
-//		err = client.Call("ReplicaRPC.Prepare", args, &reply)
-//		resultChan <- rpcResult{&reply, err}
-//	}()
-//
-//	select {
-//	case result := <-resultChan:
-//		duration := time.Since(startTime)
-//		success := result.err == nil
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, success, result.err)
-//
-//		return result.reply, result.err
-//	case <-time.After(5 * time.Second):
-//		duration := time.Since(startTime)
-//		timeoutErr := fmt.Errorf("RPC call to %s timed out", address)
-//
-//		LogRPCComplete(args.ReplicaID, address, "ReplicaRPC.Prepare", duration, false, timeoutErr)
-//
-//		return nil, timeoutErr
-//	}
-//}
-
-// runLocalPreAccept runs PreAccept logic locally and returns the result
 func (r *Replica) runLocalPreAccept(command Command, cmdID CommandID, seq int, deps []Dependency, ballot Ballot) (int, []Dependency) {
 	r.InstanceLock.RLock()
 	defer r.InstanceLock.RUnlock()
 
-	// === Local Conflict Detection ===
 	maxSeq := seq
 	newDeps := make([]Dependency, len(deps))
 	copy(newDeps, deps)
 
-	for rid, instanceMap := range r.Instances {
-		for iid, inst := range instanceMap {
-			if inst == nil || inst.CommandID == cmdID {
-				continue
-			}
-			if commandsConflict(inst.Command, command) {
-				// Adjust sequence number
-				if inst.Seq >= maxSeq {
-					maxSeq = inst.Seq + 1
+	// Only check conflicts with uncommitted instances
+	e := r.committedIndex[command.Key]
+	if e == nil {
+		return maxSeq, newDeps
+	}
+
+	currentTime := time.Now()
+
+	// If you're okay with a fast upper bound for bumping seq:
+	bump := e.maxSeq
+	if bump >= maxSeq {
+		maxSeq = bump + 1
+	}
+
+	if command.Type == CmdPut {
+		// PUT conflicts with writers + readers (but filter old ones)
+		for _, ik := range e.writers {
+			// Check if instance is recent enough
+			if instMap, ok := r.Instances[ik.rid]; ok {
+				if inst, ok := instMap[ik.iid]; ok {
+					if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+					}
 				}
-				// Add dependency on conflicting instance
-				newDeps = appendDependencyIfMissing(newDeps, rid, iid)
+			}
+		}
+		for _, ik := range e.readers {
+			// Check if instance is recent enough
+			if instMap, ok := r.Instances[ik.rid]; ok {
+				if inst, ok := instMap[ik.iid]; ok {
+					if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+					}
+				}
+			}
+		}
+	} else { // GET
+		// GET conflicts only with writers (but filter old ones)
+		for _, ik := range e.writers {
+			// Check if instance is recent enough
+			if instMap, ok := r.Instances[ik.rid]; ok {
+				if inst, ok := instMap[ik.iid]; ok {
+					if !inst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						newDeps = appendDependencyIfMissing(newDeps, ik.rid, ik.iid)
+					}
+				}
 			}
 		}
 	}
@@ -493,6 +394,8 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 
 	// Run PreAccept logic locally first
 	localSeq, localDeps := r.runLocalPreAccept(command, cmdID, initialSeq, initialDeps, ballot)
+
+	hadLocalConflict := (localSeq != initialSeq) || !equalDependencySlice(localDeps, initialDeps)
 
 	args := PreAcceptArgs{
 		ReplicaID:  r.ID,
@@ -590,6 +493,12 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 	}
 
+	hadReplyConflict := !same
+
+	if hadLocalConflict || hadReplyConflict {
+		IncrementConflictDetect() // counts once per request, on the leader only
+	}
+
 	// Enhanced fast path condition for redundant PreAccepts
 	canUseFastPath := same && unchangedCount >= fastPathQuorum
 
@@ -622,13 +531,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 		}
 		r.InstanceLock.Unlock()
 
-		executed := r.TryExecute(int(r.ID), instanceID)
-		if !executed {
-			for i := 0; i < 3 && !executed; i++ {
-				time.Sleep(10 * time.Millisecond)
-				executed = r.TryExecute(int(r.ID), instanceID)
-			}
-		}
+		r.onCommitted(int(r.ID), instanceID)
 
 		LogFastPath(r.ID, instanceID, fastPathQuorum, okCount, unchangedCount, command, cmdID)
 
@@ -740,15 +643,7 @@ func (r *Replica) Propose(command Command, cmdID CommandID) error {
 			Send()
 	}
 
-	executed := r.TryExecute(int(r.ID), instanceID)
-	if !executed {
-		// Brief retry if execution failed due to dependencies
-		for i := 0; i < 3 && !executed; i++ {
-			time.Sleep(10 * time.Millisecond)
-			executed = r.TryExecute(int(r.ID), instanceID)
-		}
-	}
-
+	r.onCommitted(int(r.ID), instanceID)
 	LogSlowPath(r.ID, instanceID, reason)
 
 	return nil

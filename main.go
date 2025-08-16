@@ -123,106 +123,26 @@ func main() {
 			Send()
 	}
 
-	// Enhanced background execution loop with comprehensive monitoring
-	go func() {
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
+	const execWorkers = 16
+	for i := 0; i < execWorkers; i++ {
+		go func() {
+			for k := range replica.readyCh {
+				// Attempt execution
+				executed := replica.TryExecute(k.rid, k.iid)
+				// Clean up pending flag regardless; re-enqueue only via dependency notifications
+				replica.InstanceLock.Lock()
+				delete(replica.pending, makeKey(k.rid, k.iid))
+				replica.InstanceLock.Unlock()
 
-		executionCycleCount := 0
-
-		for range ticker.C {
-			cycleStart := time.Now()
-			executionCycleCount++
-
-			// Collect instances to execute with detailed analysis
-			replica.InstanceLock.RLock()
-			var instancesToExecute []struct{ rid, iid int }
-			totalInstances := 0
-			committedInstances := 0
-			executedInstances := 0
-
-			for rid, instMap := range replica.Instances {
-				for iid, inst := range instMap {
-					totalInstances++
-					if inst != nil {
-						if inst.Committed {
-							committedInstances++
-						}
-						if inst.Executed {
-							executedInstances++
-						}
-						if inst.Committed && !inst.Executed {
-							instancesToExecute = append(instancesToExecute, struct{ rid, iid int }{rid, iid})
-						}
-					}
+				if executed {
+					replica.onExecuted(k.rid, k.iid)
+				} else {
+					// Still blocked? We'll wake it via onExecuted(dep) later.
+					// Optional: set a small fallback timer to retry in case of missed signals.
 				}
 			}
-			replica.InstanceLock.RUnlock()
-
-			// Log execution cycle statistics every 10 cycles
-			if executionCycleCount%10 == 0 {
-				GetLogger().Log(DEBUG, EXECUTION, "Background execution cycle statistics").
-					WithContext("cycle_count", executionCycleCount).
-					WithContext("total_instances", totalInstances).
-					WithContext("committed_instances", committedInstances).
-					WithContext("executed_instances", executedInstances).
-					WithContext("pending_execution", len(instancesToExecute)).
-					WithTags("execution", "background", "statistics").
-					Send()
-			}
-
-			if len(instancesToExecute) > 0 {
-				GetLogger().Log(DEBUG, EXECUTION, "Found instances pending execution").
-					WithContext("pending_count", len(instancesToExecute)).
-					WithContext("cycle_count", executionCycleCount).
-					WithTags("execution", "background", "pending").
-					Send()
-
-				// Execute instances with limited concurrency to avoid resource exhaustion
-				const maxConcurrentExecutions = 10
-				semaphore := make(chan struct{}, maxConcurrentExecutions)
-
-				for _, inst := range instancesToExecute {
-					semaphore <- struct{}{} // Acquire
-					go func(rid, iid int) {
-						execStart := time.Now()
-						defer func() { <-semaphore }() // Release
-						defer func() {
-							if r := recover(); r != nil {
-								GetLogger().Log(ERROR, EXECUTION, "Panic in background execution").
-									WithInstance(rid, iid).
-									WithContext("panic_value", r).
-									WithContext("cycle_count", executionCycleCount).
-									WithTags("execution", "panic", "recovery").
-									Send()
-							}
-						}()
-
-						success := replica.TryExecute(rid, iid)
-						execDuration := time.Since(execStart)
-
-						GetLogger().Log(DEBUG, EXECUTION, "Background execution attempt completed").
-							WithInstance(rid, iid).
-							WithContext("success", success).
-							WithDuration(execDuration).
-							WithContext("cycle_count", executionCycleCount).
-							WithTags("execution", "background", "attempt").
-							Send()
-					}(inst.rid, inst.iid)
-				}
-			}
-
-			cycleDuration := time.Since(cycleStart)
-			if cycleDuration > 100*time.Millisecond {
-				GetLogger().Log(WARN, EXECUTION, "Background execution cycle took longer than expected").
-					WithContext("cycle_duration_ms", cycleDuration.Milliseconds()).
-					WithContext("cycle_count", executionCycleCount).
-					WithContext("instances_to_execute", len(instancesToExecute)).
-					WithTags("execution", "background", "slow_cycle").
-					Send()
-			}
-		}
-	}()
+		}()
+	}
 
 	// Enhanced REPL with comprehensive command logging
 	reader := bufio.NewReader(os.Stdin)

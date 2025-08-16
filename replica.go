@@ -7,6 +7,17 @@ import (
 	"time"
 )
 
+type instKey struct{ rid, iid int }
+
+type keyEntry struct {
+	// Instances still relevant for conflicts on this key:
+	writers map[string]instKey // PUTs (and any op treated as write)
+	readers map[string]instKey // GETs
+	// Optional speedups:
+	maxSeq int            // max Seq among active instances on this key
+	seqBy  map[string]int // instKey->Seq if you want exact max
+}
+
 // Replica represents a single EPaxos node in the cluster
 type Replica struct {
 	ID           ReplicaID                       // Unique ID for this replica
@@ -16,6 +27,25 @@ type Replica struct {
 
 	NextInstance int // Next available instance slot
 	KVStore      *KVStore
+
+	readyCh       chan instKey         // bounded queue of runnable (or newly committed) instances
+	pending       map[string]struct{}  // de-dupe keys already in the queue
+	dependents    map[string][]instKey // reverse edges: X -> list that depend on X
+	remainingDeps map[string]int       // (rid,iid) -> count of unexecuted deps
+	keyIndex      map[string]*keyEntry
+
+	// NEW: Bounded tracking and speculative execution support
+	committedIndex   map[string]*keyEntry             // Index of only uncommitted instances for conflict detection
+	speculativeState map[string]*SpeculativeExecution // Track speculative executions
+	maxDependencyAge int64                            // Max age in milliseconds for dependency tracking (5 seconds)
+}
+
+// SpeculativeExecution tracks speculatively executed operations
+type SpeculativeExecution struct {
+	OriginalValue string
+	NewValue      string
+	Executed      bool
+	Timestamp     time.Time
 }
 
 // NewReplica creates a new replica with the given ID and peers
@@ -24,13 +54,123 @@ func NewReplica(id ReplicaID, peers []string) *Replica {
 		peers = []string{}
 	}
 	return &Replica{
-		ID:           id,
-		Peers:        peers,
-		Instances:    make(map[int]map[int]*EPaxosInstance),
-		NextInstance: 0,
-		KVStore:      NewKVStore(),
+		ID:               id,
+		Peers:            peers,
+		Instances:        make(map[int]map[int]*EPaxosInstance),
+		NextInstance:     0,
+		KVStore:          NewKVStore(),
+		readyCh:          make(chan instKey, 4096),
+		pending:          make(map[string]struct{}),
+		dependents:       make(map[string][]instKey),
+		remainingDeps:    make(map[string]int),
+		keyIndex:         make(map[string]*keyEntry),
+		committedIndex:   make(map[string]*keyEntry),
+		speculativeState: make(map[string]*SpeculativeExecution),
+		maxDependencyAge: 5000, // 5 seconds
 	}
 }
+
+// committedKe gets or creates a keyEntry in the committed index (for uncommitted instances only)
+func (r *Replica) committedKe(key string) *keyEntry {
+	e := r.committedIndex[key]
+	if e == nil {
+		e = &keyEntry{
+			writers: make(map[string]instKey),
+			readers: make(map[string]instKey),
+			seqBy:   make(map[string]int),
+		}
+		r.committedIndex[key] = e
+	}
+	return e
+}
+
+func (r *Replica) ke(key string) *keyEntry {
+	e := r.keyIndex[key]
+	if e == nil {
+		e = &keyEntry{
+			writers: make(map[string]instKey),
+			readers: make(map[string]instKey),
+			seqBy:   make(map[string]int),
+		}
+		r.keyIndex[key] = e
+	}
+	return e
+}
+
+// indexAdd is called once when the instance becomes visible locally (on PreAccept/Accept/Commit save).
+func (r *Replica) indexAdd(inst *EPaxosInstance, rid, iid int) {
+	// Only add to index if not yet committed (for conflict detection)
+	if !inst.Committed {
+		e := r.committedKe(inst.Command.Key)
+		k := ikey(rid, iid)
+		if inst.Command.Type == CmdPut {
+			e.writers[k] = instKey{rid, iid}
+		} else {
+			e.readers[k] = instKey{rid, iid}
+		}
+		// keep (approx) max sequence for quick bump
+		e.seqBy[k] = inst.Seq
+		if inst.Seq > e.maxSeq {
+			e.maxSeq = inst.Seq
+		}
+	}
+}
+
+// indexRemoveFromCommitted removes an instance from the committed index when it gets committed
+func (r *Replica) indexRemoveFromCommitted(cmd Command, rid, iid int) {
+	e := r.committedIndex[cmd.Key]
+	if e == nil {
+		return
+	}
+	k := ikey(rid, iid)
+	delete(e.writers, k)
+	delete(e.readers, k)
+	if s, ok := e.seqBy[k]; ok {
+		delete(e.seqBy, k)
+		if s >= e.maxSeq {
+			// recompute lazily only when necessary
+			e.maxSeq = 0
+			for _, v := range e.seqBy {
+				if v > e.maxSeq {
+					e.maxSeq = v
+				}
+			}
+		}
+	}
+	// Clean up empty entries
+	if len(e.writers) == 0 && len(e.readers) == 0 {
+		delete(r.committedIndex, cmd.Key)
+	}
+}
+
+// indexRemove is called once after Execute completes.
+func (r *Replica) indexRemove(cmd Command, rid, iid int) {
+	e := r.keyIndex[cmd.Key]
+	if e == nil {
+		return
+	}
+	k := ikey(rid, iid)
+	delete(e.writers, k)
+	delete(e.readers, k)
+	if s, ok := e.seqBy[k]; ok {
+		delete(e.seqBy, k)
+		if s >= e.maxSeq {
+			// recompute lazily only when necessary
+			e.maxSeq = 0
+			for _, v := range e.seqBy {
+				if v > e.maxSeq {
+					e.maxSeq = v
+				}
+			}
+		}
+	}
+	// Optional: if empty, delete the entry to keep memory tidy
+	if len(e.writers) == 0 && len(e.readers) == 0 {
+		delete(r.keyIndex, cmd.Key)
+	}
+}
+
+func ikey(rid, iid int) string { return fmt.Sprintf("%d-%d", rid, iid) }
 
 // DependencyGraph represents the dependency graph for execution
 type DependencyGraph struct {
@@ -212,7 +352,7 @@ func (r *Replica) BuildDependencyGraph(replicaID, instanceID int) *DependencyGra
 	return graph
 }
 
-// TryExecute attempts to execute a committed command following the EPaxos execution algorithm
+// TryExecute attempts to execute a committed command with speculative execution support
 func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 	r.InstanceLock.Lock()
 	defer r.InstanceLock.Unlock()
@@ -220,7 +360,6 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 	// Check if instance exists and is in the right state
 	instanceMap, ok := r.Instances[replicaID]
 	if !ok {
-		// Instance map doesn't exist - try to recover
 		GetLogger().Warn(EXECUTION, "Instance map for replica %d not found, attempting recovery", replicaID)
 		go r.RecoverInstance(replicaID, instanceID)
 		return false
@@ -228,7 +367,6 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 
 	inst, ok := instanceMap[instanceID]
 	if !ok {
-		// Instance doesn't exist - try to recover
 		GetLogger().Warn(EXECUTION, "Instance R%d.%d not found, attempting recovery", replicaID, instanceID)
 		go r.RecoverInstance(replicaID, instanceID)
 		return false
@@ -248,8 +386,45 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 
 	LogExecutionAttempt(ReplicaID(replicaID), instanceID, inst)
 
-	// Step 1: Build dependency graph (lock already held)
-	graph := r.BuildDependencyGraph(replicaID, instanceID)
+	// Check for speculative execution opportunity
+	canSpeculate := true
+	hasUnresolvedDeps := false
+
+	// Check dependencies with age limit
+	currentTime := time.Now()
+	for _, dep := range inst.Deps {
+		// Skip old dependencies (bounded tracking)
+		if depMap, ok := r.Instances[dep.ReplicaID]; ok {
+			if depInst, ok := depMap[dep.InstanceID]; ok {
+				// Check if dependency is too old (older than maxDependencyAge)
+				if depInst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+					continue // Skip old dependency
+				}
+				if !depInst.Executed {
+					hasUnresolvedDeps = true
+					// Don't speculate if critical dependencies are unresolved
+					if depInst.Command.Key == inst.Command.Key {
+						canSpeculate = false
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Try speculative execution if safe
+	if canSpeculate && hasUnresolvedDeps {
+		r.speculativeExecute(replicaID, instanceID, inst)
+		return false // Return false but mark as speculatively executed
+	}
+
+	// If can't speculate and has unresolved deps, wait
+	if !canSpeculate && hasUnresolvedDeps {
+		return false
+	}
+
+	// Normal execution path - build minimal dependency graph
+	graph := r.BuildMinimalDependencyGraph(replicaID, instanceID)
 
 	// Check if the target instance is in the graph
 	targetKey := makeKey(replicaID, instanceID)
@@ -258,11 +433,10 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 		return false
 	}
 
-	// Step 2: Find strongly connected components
+	// Find strongly connected components
 	sccs := graph.StronglyConnectedComponents()
 
-	// Step 3: Locate the SCC containing the target instance
-	targetKey = makeKey(replicaID, instanceID)
+	// Locate the SCC containing the target instance
 	var targetSCC []string
 	for _, scc := range sccs {
 		for _, k := range scc {
@@ -280,31 +454,7 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 		return false
 	}
 
-	// Step 4: Ensure all external dependencies of the target SCC are executed
-	inSCC := make(map[string]bool, len(targetSCC))
-	for _, k := range targetSCC {
-		inSCC[k] = true
-	}
-	for _, k := range targetSCC {
-		node := graph.Nodes[k]
-		for _, dep := range node.Instance.Deps {
-			depKey := makeKey(dep.ReplicaID, dep.InstanceID)
-			if inSCC[depKey] {
-				continue // internal edge
-			}
-			if depMap, ok := r.Instances[dep.ReplicaID]; !ok {
-				GetLogger().Debug(EXECUTION, "External dependency R%d.%d: replica map missing", dep.ReplicaID, dep.InstanceID)
-				// attempt recovery and bail
-				go r.RecoverInstance(dep.ReplicaID, dep.InstanceID)
-				return false
-			} else if depInst, ok := depMap[dep.InstanceID]; !ok || !depInst.Executed {
-				GetLogger().Debug(EXECUTION, "External dependency R%d.%d not executed yet", dep.ReplicaID, dep.InstanceID)
-				return false
-			}
-		}
-	}
-
-	// Step 5: Execute commands in the SCC containing the target, ordered by (Seq, ReplicaID, InstanceID)
+	// Execute commands in the SCC
 	executed := false
 	var sccInstances []*GraphNode
 	for _, k := range targetSCC {
@@ -328,20 +478,72 @@ func (r *Replica) TryExecute(replicaID int, instanceID int) bool {
 		}
 	}
 
-	if !executed {
-		GetLogger().Warn(EXECUTION, "Target instance R%d.%d was not executed in any SCC", replicaID, instanceID)
-		return false
-	}
-
-	return true
+	return executed
 }
 
-func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance) bool {
+// speculativeExecute performs speculative execution
+func (r *Replica) speculativeExecute(replicaID, instanceID int, inst *EPaxosInstance) {
+	if inst.Command.Type == CmdGet {
+		// Don't speculate on reads
+		return
+	}
 
+	key := inst.Command.Key
+	specKey := makeKey(replicaID, instanceID)
+
+	// Save original state for potential rollback
+	originalValue, _ := r.KVStore.Get(key)
+
+	spec := &SpeculativeExecution{
+		OriginalValue: originalValue,
+		NewValue:      inst.Command.Value,
+		Executed:      true,
+		Timestamp:     time.Now(),
+	}
+	r.speculativeState[specKey] = spec
+
+	// Apply speculatively
+	r.KVStore.Put(key, inst.Command.Value)
+
+	GetLogger().Debug(EXECUTION, "Speculatively executed instance R%d.%d", replicaID, instanceID)
+}
+
+// rollbackSpeculative rolls back a speculative execution
+func (r *Replica) rollbackSpeculative(replicaID, instanceID int, inst *EPaxosInstance) {
+	specKey := makeKey(replicaID, instanceID)
+	if spec, ok := r.speculativeState[specKey]; ok {
+		if spec.Executed {
+			r.KVStore.Put(inst.Command.Key, spec.OriginalValue)
+			GetLogger().Debug(EXECUTION, "Rolled back speculative execution for instance R%d.%d", replicaID, instanceID)
+		}
+		delete(r.speculativeState, specKey)
+	}
+}
+
+// executeCommand executes a command with speculative support
+func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance) bool {
 	startTime := time.Now()
 
 	if inst.Executed {
 		return true
+	}
+
+	// Check if this was speculatively executed
+	specKey := makeKey(replicaID, instanceID)
+	if spec, ok := r.speculativeState[specKey]; ok {
+		// Validate speculative execution
+		if spec.NewValue == inst.Command.Value {
+			// Speculation was correct, just mark as executed
+			inst.Executed = true
+			inst.Status = StatusExecuted
+			delete(r.speculativeState, specKey)
+			totalDuration := time.Since(startTime)
+			LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, "speculative-success", totalDuration)
+			return true
+		} else {
+			// Speculation was wrong, rollback
+			r.rollbackSpeculative(replicaID, instanceID, inst)
+		}
 	}
 
 	// Check if this is a no-op command
@@ -362,15 +564,67 @@ func (r *Replica) executeCommand(replicaID, instanceID int, inst *EPaxosInstance
 	totalDuration := time.Since(startTime)
 
 	if err != nil {
-		// Log the error but still consider the command as successfully executed
-		// For GET operations, "key not found" is a valid result, not a failure
 		LogExecutionFailure(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, err)
-		// You might want to store the error as the result for client response
 	} else {
 		LogExecutionSuccess(ReplicaID(replicaID), instanceID, inst.Command, inst.CommandID, result, totalDuration)
 	}
 
 	return true
+}
+
+// BuildMinimalDependencyGraph builds a minimal dependency graph with bounded scope
+func (r *Replica) BuildMinimalDependencyGraph(replicaID, instanceID int) *DependencyGraph {
+	graph := NewDependencyGraph()
+	visited := make(map[string]bool)
+	currentTime := time.Now()
+	maxDepth := 10 // Limit recursion depth
+
+	var buildRecursive func(int, int, int)
+	buildRecursive = func(rid, iid, depth int) {
+		if depth > maxDepth {
+			return // Stop at max depth
+		}
+
+		key := makeKey(rid, iid)
+		if visited[key] {
+			return
+		}
+		visited[key] = true
+
+		instanceMap, exists := r.Instances[rid]
+		if !exists {
+			return
+		}
+		instance, exists := instanceMap[iid]
+		if !exists {
+			return
+		}
+		if !instance.Committed {
+			return
+		}
+
+		// Skip old instances (bounded tracking)
+		if instance.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+			return
+		}
+
+		graph.AddNode(rid, iid, instance)
+
+		for _, dep := range instance.Deps {
+			// Check if dependency is recent enough
+			if depMap, ok := r.Instances[dep.ReplicaID]; ok {
+				if depInst, ok := depMap[dep.InstanceID]; ok {
+					if !depInst.Timestamp.Time.Before(currentTime.Add(-time.Duration(r.maxDependencyAge) * time.Millisecond)) {
+						buildRecursive(dep.ReplicaID, dep.InstanceID, depth+1)
+						graph.AddEdge(rid, iid, dep.ReplicaID, dep.InstanceID)
+					}
+				}
+			}
+		}
+	}
+
+	buildRecursive(replicaID, instanceID, 0)
+	return graph
 }
 
 // GetInstance safely retrieves an instance with proper error handling
